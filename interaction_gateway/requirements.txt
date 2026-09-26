@@ -1,0 +1,8 @@
+fastapi>=0.115
+uvicorn[standard]>=0.34
+httpx>=0.27
+numpy>=1.24
+kaldi-native-fbank>=1.22.3
+librosa>=0.11
+soundfile>=0.14
+onnxruntime>=1.22

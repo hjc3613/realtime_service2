@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Realtime Signal Lab</title>
+    <link rel="stylesheet" href="/debug-assets/styles.css" />
+  </head>
+  <body>
+    <div class="noise"></div>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark"><span></span><span></span><span></span></div>
+          <div><p class="eyebrow">LOCAL / DIAGNOSTICS</p><h1>Realtime Signal Lab</h1></div>
+        </div>
+        <div class="connection-state" id="connectionState" data-state="offline"><i></i><span>OFFLINE</span></div>
+      </header>
+
+      <section class="control-panel panel">
+        <div class="field grow"><label for="serverUrl">WebSocket endpoint</label><input id="serverUrl" autocomplete="off" spellcheck="false" /></div>
+        <div class="field model-field"><label for="model">Model</label><input id="model" value="br-voice-realtime" spellcheck="false" /></div>
+        <button class="button primary" id="connectButton"><span class="button-dot"></span><span>Connect</span></button>
+      </section>
+
+      <section class="metrics" aria-label="connection metrics">
+        <article><span>SESSION</span><strong id="sessionMetric">—</strong></article>
+        <article><span>ROUND TRIP</span><strong id="latencyMetric">—</strong></article>
+        <article><span>AUDIO UP</span><strong id="audioUpMetric">0.0s</strong></article>
+        <article><span>AUDIO DOWN</span><strong id="audioDownMetric">0.0s</strong></article>
+        <article><span>EVENTS</span><strong id="eventMetric">0</strong></article>
+      </section>
+
+      <div class="workspace">
+        <section class="conversation panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">LIVE TRANSCRIPT</p><h2>Conversation</h2></div>
+            <button class="icon-button" id="clearConversation" title="清空对话显示">Clear</button>
+          </div>
+          <div class="timeline" id="timeline">
+            <div class="empty-state" id="emptyState">
+              <div class="orb"><div></div></div><h3>Ready for a signal</h3>
+              <p>连接服务并开启麦克风。页面会显示转写、模型回复、工具调用和协议错误。</p>
+            </div>
+          </div>
+          <div class="voice-dock">
+            <div class="level-wrap"><span>INPUT</span><div class="level-track"><i id="inputLevel"></i></div></div>
+            <button class="mic-button" id="micButton" disabled aria-label="开启麦克风">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm-1-9a1 1 0 1 1 2 0v6a1 1 0 1 1-2 0V6Zm7 6a1 1 0 1 1 2 0 8 8 0 0 1-7 7.94V22h3a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h3v-2.06A8 8 0 0 1 4 12a1 1 0 1 1 2 0 6 6 0 0 0 12 0Z"/></svg>
+            </button>
+            <div class="voice-copy"><strong id="micLabel">Microphone off</strong><span id="micHint">连接后点击开始说话</span></div>
+            <button class="button secondary" id="commitButton" disabled>Commit turn</button>
+            <button class="icon-button speaker" id="speakerButton" title="静音输出" aria-pressed="false">Sound on</button>
+          </div>
+        </section>
+
+        <aside class="diagnostics panel">
+          <div class="tabs" role="tablist">
+            <button class="tab active" data-tab="events">Events</button><button class="tab" data-tab="session">Session</button>
+            <button class="tab" data-tab="tools">Tools <b id="toolBadge"></b></button>
+          </div>
+          <div class="tab-view active" id="eventsTab">
+            <div class="event-toolbar">
+              <select id="eventFilter" aria-label="过滤事件"><option value="all">All events</option><option value="server">Server only</option><option value="client">Client only</option><option value="error">Errors</option></select>
+              <button class="icon-button" id="clearEvents">Clear</button>
+            </div>
+            <div class="event-list" id="eventList"></div>
+            <div class="raw-composer"><label for="rawEvent">Send raw event</label><textarea id="rawEvent" spellcheck="false">{"type":"input_audio_buffer.clear"}</textarea><button class="button secondary" id="sendRawButton" disabled>Send JSON</button></div>
+          </div>
+          <div class="tab-view" id="sessionTab">
+            <label for="instructions">Instructions</label>
+            <textarea id="instructions" class="large" spellcheck="false">You are a concise, helpful voice assistant. Reply in the language used by the user.</textarea>
+            <label for="toolsJson">Tool definitions (JSON array)</label>
+            <textarea id="toolsJson" class="code large" spellcheck="false">[
+  {
+    "type": "function",
+    "name": "get_current_time",
+    "description": "Get the current local time for a city",
+    "parameters": {
+      "type": "object",
+      "properties": { "city": { "type": "string" } },
+      "required": ["city"]
+    }
+  }
+]</textarea>
+            <button class="button primary full" id="updateSessionButton" disabled>Update session</button>
+          </div>
+          <div class="tab-view" id="toolsTab"><div class="tool-empty" id="toolEmpty">Tool calls will appear here.</div><div id="toolCalls"></div></div>
+        </aside>
+      </div>
+    </main>
+    <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+    <script src="/debug-assets/app.js"></script>
+  </body>
+</html>

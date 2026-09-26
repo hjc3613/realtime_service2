@@ -1,0 +1,24 @@
+{
+  "full_clause_playback": {
+    "audio_seconds_emitted": 6.0,
+    "transcript_events_during_audio": 0,
+    "transcript_events_total": 1
+  },
+  "interrupt_after_two_seconds": {
+    "audio_seconds_emitted": 2.0,
+    "transcript_events_during_audio": 0,
+    "transcript_events_total": 0
+  },
+  "queued_user_text_remaining": [
+    "And make the size eight."
+  ],
+  "tts_chunks": [
+    "The price is $54.",
+    "85.",
+    "Your email is a.",
+    "b@example.",
+    "com."
+  ],
+  "tts_tail": "",
+  "scope": "current source selected-method probe; no live inference"
+}

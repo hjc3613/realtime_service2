@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import asyncio
+import unittest
+from unittest.mock import AsyncMock
+
+from service_app.config import Settings
+from service_app.session import RealtimeSession
+
+
+class _ToolCallingTextBackend:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = False
+
+    async def stream(self, messages, tools):
+        yield {"content": "I am checking that now.", "tool_calls": []}
+        self.started.set()
+        await self.release.wait()
+        self.finished = True
+        yield {
+            "content": "",
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call_latest",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        }
+
+
+class _TTSBackend:
+    async def synthesize(self, text: str) -> bytes:
+        return b"\xff" * 1600
+
+
+class RealtimeSessionTests(unittest.IsolatedAsyncioTestCase):
+    def make_session(self) -> tuple[RealtimeSession, list[dict]]:
+        events: list[dict] = []
+
+        async def send(event: dict) -> None:
+            events.append(event)
+
+        settings = Settings(
+            greeting="",
+            interactive_debug_dir=None,
+            tts_realtime_pacing=False,
+        )
+        return RealtimeSession(send, settings), events
+
+    async def test_pending_turn_is_latest_wins(self) -> None:
+        session, _ = self.make_session()
+        session._queue_pending_user_turn(
+            {"role": "user", "content": "old request"},
+            {"role": "user", "content": "old request"},
+            "",
+        )
+        session._queue_pending_user_turn(
+            {"role": "user", "content": "latest request"},
+            {"role": "user", "content": "latest request"},
+            "",
+        )
+
+        self.assertEqual(len(session.pending_user_turns), 1)
+        self.assertEqual(
+            session.pending_user_turns[0][0]["content"], "latest request"
+        )
+
+    async def test_pending_turn_waits_until_user_releases_floor(self) -> None:
+        session, _ = self.make_session()
+        session._run_response = AsyncMock()
+        session._queue_pending_user_turn(
+            {"role": "user", "content": "latest request"},
+            {"role": "user", "content": "latest request"},
+            "",
+        )
+        session.speech_seen = True
+
+        session._start_deferred_response()
+        self.assertIsNone(session.response_task)
+
+        session.speech_seen = False
+        session._start_deferred_response()
+        await asyncio.sleep(0)
+
+        self.assertEqual(session.history[-1]["content"], "latest request")
+        session._run_response.assert_awaited_once()
+
+    async def test_interrupt_cancels_tts_but_not_response_task(self) -> None:
+        session, _ = self.make_session()
+        response_release = asyncio.Event()
+        tts_release = asyncio.Event()
+        session.response_task = asyncio.create_task(response_release.wait())
+        session.tts_task = asyncio.create_task(tts_release.wait())
+
+        await session._interrupt()
+        await asyncio.sleep(0)
+
+        self.assertFalse(session.response_task.done())
+        self.assertTrue(session.tts_task.cancelled())
+
+        session.response_task.cancel()
+        await asyncio.gather(session.response_task, return_exceptions=True)
+
+    async def test_interrupted_response_drains_llm_and_emits_tool_call(self) -> None:
+        session, events = self.make_session()
+        text = _ToolCallingTextBackend()
+        session.text = text
+        session.tts = _TTSBackend()
+        session.history = [{"role": "system", "content": "test"}]
+        session.tools = [
+            {
+                "name": "lookup",
+                "description": "",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+
+        session.response_task = asyncio.create_task(session._run_response())
+        await text.started.wait()
+        await session._interrupt()
+        text.release.set()
+        await session.response_task
+
+        self.assertTrue(text.finished)
+        self.assertIn("call_latest", session.pending_tool_calls)
+        event_types = [event["type"] for event in events]
+        self.assertIn("response.function_call_arguments.done", event_types)
+        self.assertIn("response.cancelled", event_types)
+        self.assertNotIn("response.text.done", event_types)
+
+    async def test_history_user_audio_is_limited_to_five_seconds(self) -> None:
+        session, _ = self.make_session()
+        ten_seconds_pcm = b"\x00\x00" * 16000 * 10
+
+        trimmed = session._history_user_pcm(ten_seconds_pcm)
+
+        self.assertEqual(len(trimmed), 32000 * 5)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
