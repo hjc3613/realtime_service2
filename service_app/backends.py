@@ -245,10 +245,18 @@ class TTSBackend:
                 headers={"Authorization": f"Bearer {self.settings.api_key}"},
             )
             if response.is_error:
+                request_id = response.headers.get("x-request-id", "unknown")
+                detail = response.text[:2000]
+                message = (
+                    f"TTS backend HTTP {response.status_code} "
+                    f"model={payload['model']} voice={payload['voice']} "
+                    f"chars={len(text)} request_id={request_id}: {detail}"
+                )
                 logger.error(
-                    "TTS backend HTTP %d: %s",
-                    response.status_code,
-                    response.text[:2000],
+                    "%s", message,
+                )
+                raise httpx.HTTPStatusError(
+                    message, request=response.request, response=response
                 )
             response.raise_for_status()
         return response.content
@@ -304,13 +312,21 @@ class TTSBackend:
 CLAUSE_END_RE = re.compile(r"[;；:：.!?。！？\n]+")
 
 
+def _has_speech_text(text: str) -> bool:
+    # Closing quotes and punctuation can arrive after a sentence boundary,
+    # including in a later LLM delta. Sending such a standalone fragment to TTS
+    # can make the upstream audio stream fail. Keep letters/numbers in any
+    # language, and discard fragments with no speakable text.
+    return any(character.isalnum() for character in text)
+
+
 def streaming_clause_chunks(text: str) -> tuple[list[str], str]:
     """Return punctuation-terminated chunks and the unfinished text tail."""
     chunks: list[str] = []
     start = 0
     for match in CLAUSE_END_RE.finditer(text):
         chunk = text[start : match.end()].strip()
-        if chunk:
+        if _has_speech_text(chunk):
             chunks.append(chunk)
         start = match.end()
     return chunks, text[start:]
@@ -318,6 +334,6 @@ def streaming_clause_chunks(text: str) -> tuple[list[str], str]:
 
 def clause_chunks(text: str) -> list[str]:
     chunks, remainder = streaming_clause_chunks(text)
-    if remainder.strip():
+    if _has_speech_text(remainder):
         chunks.append(remainder.strip())
     return chunks

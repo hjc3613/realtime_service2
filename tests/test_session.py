@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
+import json
 import unittest
-from unittest.mock import AsyncMock
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 from dataclasses import replace
 
 from service_app.audio import ulaw_to_pcm16, wav_to_pcm16
 from service_app.config import Settings
 from service_app.session import RealtimeSession
+from service_app.backends import audio_message
+from new_interactive_assets.evaluate_duplex import make_messages
 
 
 class _ToolCallingTextBackend:
@@ -500,6 +505,162 @@ class RealtimeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(interactive.audio_lengths), 2)
         self.assertTrue(all(length > 0 for length in interactive.audio_lengths))
         await session.close()
+
+    def test_semantic_prompt_uses_new_three_way_labels(self) -> None:
+        session, _ = self.make_session()
+
+        messages = session._classifier_messages(b"\x00\x00", interrupt=False)
+
+        self.assertIn("idle-state semantic completion detector", messages[0]["content"])
+        self.assertIn("ignorable", messages[0]["content"])
+        self.assertIn("incomplete", messages[0]["content"])
+        self.assertIn("complete", messages[0]["content"])
+
+    async def test_interrupt_mode_keeps_backchannel_compatibility(self) -> None:
+        session, _ = self.make_session()
+        session.assistant_active = True
+        session.speech_seen = True
+        session.interactive.classify = AsyncMock(return_value="backchannel")
+        messages = session._classifier_messages(b"\x00\x00", interrupt=True)
+
+        await session._classify_window(0, 0, True, b"\x00\x00", messages, 1, 1)
+
+        labels = session.interactive.classify.await_args.args[1]
+        self.assertEqual(labels, ["interrupt", "backchannel", "ignorable"])
+        self.assertIn("speaking-state interruption detector", messages[0]["content"])
+
+    def test_classifier_messages_match_ms_swift_training_conversion(self) -> None:
+        """Compare real training rows with the evaluator's audio-url conversion."""
+        root = Path(__file__).resolve().parents[1] / "new_interactive_assets/ms_swift"
+        current_pcm = b"\x01\x00" * 160
+        current_url = audio_message(current_pcm)["audio_url"]["url"]
+        for task in ("interrupt", "semantic_complete"):
+            with (root / task / "train.jsonl").open(encoding="utf-8") as source:
+                for line_number, line in enumerate(source, 1):
+                    row = json.loads(line)
+                    with self.subTest(task=task, line=line_number):
+                        def audio_url(path):
+                            return current_url if path == row["audios"][-1] else path
+
+                        with patch(
+                            "new_interactive_assets.evaluate_duplex.audio_data_url",
+                            side_effect=audio_url,
+                        ):
+                            expected, _, _ = make_messages(row)
+                        session, _ = self.make_session()
+                        session.interaction_history = copy.deepcopy(expected[1:-1])
+                        if task == "interrupt" and len(expected[-1]["content"]) == 3:
+                            session.interaction_history.append(
+                                {"role": "user", "content": [expected[-1]["content"][0]]}
+                            )
+                        original_history = copy.deepcopy(session.interaction_history)
+                        session.current_assistant_text = "Unfinished assistant response"
+
+                        actual = session._classifier_messages(
+                            current_pcm, interrupt=task == "interrupt"
+                        )
+
+                        self.assertEqual(actual, expected)
+                        self.assertEqual(session.interaction_history, original_history)
+
+    async def test_ignorable_audio_is_retained_separately_and_bounded(self) -> None:
+        session, _ = self.make_session()
+        session.settings = replace(session.settings, ignorable_audio_max_s=1)
+        first = b"\x01\x00" * 12000
+        second = b"\x02\x00" * 10000
+
+        session.input_pcm.extend(first)
+        session.input_ulaw.extend(b"\x01" * 6000)
+        session.speech_seen = True
+        session._apply_completeness_classification("ignorable")
+        self.assertFalse(session.speech_seen)
+        self.assertFalse(session.semantic_turn_started)
+        self.assertEqual(bytes(session.ignorable_pcm), first)
+
+        session.input_pcm.extend(second)
+        session.input_ulaw.extend(b"\x02" * 5000)
+        session.speech_seen = True
+        session._apply_completeness_classification("ignorable")
+        self.assertEqual(len(session.ignorable_pcm), 32000)
+        self.assertEqual(bytes(session.ignorable_pcm[-len(second) :]), second)
+
+    async def test_ignorable_result_preserves_audio_received_in_flight(self) -> None:
+        session, _ = self.make_session()
+        classified = b"\x01\x00" * 1600
+        newer = b"\x02\x00" * 800
+        session.input_pcm.extend(classified + newer)
+        session.input_ulaw.extend(b"\x01" * 800 + b"\x02" * 400)
+        session.tick_audio.extend(b"\x02" * 400)
+        session.speech_seen = True
+        session.candidate_speech_ms = 150
+
+        session._apply_completeness_classification(
+            "ignorable",
+            classified_pcm_bytes=len(classified),
+            classified_audio_ms=100,
+        )
+
+        self.assertEqual(bytes(session.ignorable_pcm), classified)
+        self.assertEqual(bytes(session.input_pcm), newer)
+        self.assertEqual(bytes(session.input_ulaw), b"\x02" * 400)
+        self.assertEqual(bytes(session.tick_audio), b"\x02" * 400)
+        self.assertTrue(session.speech_seen)
+        self.assertFalse(session.semantic_turn_started)
+
+    def test_incomplete_locks_turn_against_later_ignorable(self) -> None:
+        session, _ = self.make_session()
+        session.input_pcm.extend(b"\x00\x00" * 100)
+        session.input_ulaw.extend(b"\xff" * 100)
+        session.speech_seen = True
+
+        session._apply_completeness_classification("incomplete")
+
+        self.assertTrue(session.semantic_turn_started)
+        with self.assertRaisesRegex(ValueError, "unexpected semantic"):
+            session._apply_completeness_classification("ignorable")
+        self.assertTrue(session.speech_seen)
+        self.assertEqual(session.ignorable_pcm, bytearray())
+
+    def test_incomplete_result_commits_if_silence_already_elapsed(self) -> None:
+        session, _ = self.make_session()
+        session.candidate_silence_ms = session.settings.silence_ms
+        session._schedule_user_commit = unittest.mock.Mock()
+
+        session._apply_completeness_classification("incomplete")
+
+        session._schedule_user_commit.assert_called_once_with()
+
+    async def test_semantic_choices_drop_ignorable_after_incomplete(self) -> None:
+        session, _ = self.make_session()
+        session.speech_seen = True
+        session.input_pcm.extend(b"\x00\x00")
+        session.interactive.classify = AsyncMock(side_effect=["incomplete", "complete"])
+        messages = session._classifier_messages(b"\x00\x00", interrupt=False)
+
+        await session._classify_window(0, 0, False, b"\x00\x00", messages, 1, 1)
+        self.assertTrue(session.semantic_turn_started)
+        await session._classify_window(0, 0, False, b"\x00\x00", messages, 1, 1)
+
+        calls = session.interactive.classify.await_args_list
+        self.assertEqual(calls[0].args[1], ["ignorable", "incomplete", "complete"])
+        self.assertEqual(calls[1].args[1], ["complete", "incomplete"])
+
+    async def test_incomplete_turn_commits_after_configured_silence(self) -> None:
+        session, _ = self.make_session()
+        session.settings = replace(session.settings, classifier_window_ticks=100)
+        session.vad = _NeverSpeechVAD()
+        session.semantic_turn_started = True
+        session.speech_seen = True
+        session.input_pcm.extend(b"\x00\x00" * 160)
+        session.input_ulaw.extend(b"\xff" * 80)
+        session._schedule_user_commit = unittest.mock.Mock()
+        packet = base64.b64encode(
+            b"\xff" * (session.settings.silence_ms * 8)
+        ).decode()
+
+        await session._append_audio(packet)
+
+        session._schedule_user_commit.assert_called_once_with()
 
     async def test_tool_continuation_ignores_noisy_speech_candidate(self) -> None:
         session, _ = self.make_session()

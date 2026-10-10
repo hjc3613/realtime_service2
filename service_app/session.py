@@ -409,27 +409,30 @@ def build_asr_messages(
     return messages
 
 
-INTERRUPT_SYSTEM_PROMPT = """Task: Voice Interruption Detection.
-Context: The AI is currently speaking.
-Input: A fixed-size user-side audio chunk.
-Instruction: Classify the audio as exactly one of the following:
-1. ignorable (noise, none-target speaker talking, non-speech)
-2. backchannel (short agreement, e.g., "mhm", AI should continue)
-3. interrupt (meaningful speech, AI must stop)
-
-Output only the label string without any formatting.
-"""
+# Keep these strings byte-for-byte aligned with the ms-swift training messages.
+INTERRUPT_SYSTEM_PROMPT = (
+    "You are a speaking-state interruption detector. The assistant is currently "
+    "speaking. Classify only the current audio window using the preceding user "
+    "audio as voice context. Ignore environmental noise, third-party conversations, "
+    "and brief acknowledgements that do not request the floor. interrupt = an "
+    "audible stop command or a target user taking the floor; ignorable = no target "
+    "interaction or only a brief acknowledgement without requesting the floor. "
+    "Reply with exactly one of: ignorable, interrupt."
+)
 INTERRUPT_QUERY = (
-    "given the above dialogue history, the incoming audio should interrupt the AI? "
-    "or is it just a backchannel or ignorable audio?"
+    "stage=speaking; classify the current audio window.\n"
 )
 COMPLETE_SYSTEM_PROMPT = (
-    "Judge whether the current user's spoken turn is semantically complete in the "
-    "conversation. Reply with exactly complete or incomplete. Background noise and "
-    "other speakers are not the target user."
+    "You are an idle-state semantic completion detector. The assistant has "
+    "finished speaking or has been interrupted and is already idle. Classify "
+    "only the accumulated current audio: ignorable = no target user interaction "
+    "yet; incomplete = the target user started but has not finished, including "
+    "pauses with background speech; complete = a complete target user intent. "
+    "A target user may change topics. Ignore environmental noise and non-target "
+    "conversations. Reply with exactly one of: ignorable, incomplete, complete."
 )
 COMPLETE_QUERY = (
-    "given the above dialogue history, is the incoming audio semantic complete?"
+    "stage=idle; classify the current accumulated audio."
 )
 THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
@@ -474,7 +477,16 @@ def _visible_text(part: str, state: str, buffer: str) -> tuple[str, str, str]:
 
 class RealtimeSession:
     def __init__(self, send: Send, settings: Settings):
-        self.send = send
+        self._send = send
+        self.debug_enabled = False
+        self.debug_paused = False
+        self.debug_audio_on_demand = False
+        self.debug_classifier_inputs: dict[str, list[dict[str, Any]]] = {}
+        self.last_client_event_at = time.perf_counter()
+        self.last_audio_received_at: float | None = None
+        self.debug_paused_at: float | None = None
+        self.debug_resume = asyncio.Event()
+        self.debug_resume.set()
         self.settings = settings
         self.interactive = InteractiveBackend(settings)
         self.text = TextBackend(settings)
@@ -488,6 +500,7 @@ class RealtimeSession:
         self.interaction_history: list[dict[str, Any]] = []
         self.input_ulaw = bytearray()
         self.input_pcm = bytearray()
+        self.ignorable_pcm = bytearray()
         self.tick_audio = bytearray()
         self.interrupt_window_ulaw = bytearray()
         self.pre_roll_ulaw = bytearray()
@@ -499,6 +512,7 @@ class RealtimeSession:
         self.classifier_task: asyncio.Task[None] | None = None
         self.user_commit_task: asyncio.Task[None] | None = None
         self.consecutive_complete_count = 0
+        self.semantic_turn_started = False
         self.consecutive_interrupt_count = 0
         self.interrupt_confirmed = False
         self.interrupt_negative_count = 0
@@ -540,6 +554,13 @@ class RealtimeSession:
         self.diagnostic_audio = bytearray()
         self.diagnostic_speech_packets = 0
 
+    async def send(self, event: dict[str, Any]) -> None:
+        # Keep debug reports available for inspection while ordinary output is
+        # frozen. The browser opts in; other realtime clients receive no extras.
+        if not event["type"].startswith("debug."):
+            await self.debug_resume.wait()
+        await self._send(event)
+
     async def start(self) -> None:
         await self.send(
             _event(
@@ -553,16 +574,19 @@ class RealtimeSession:
         logger.info(
             "session=%s created interrupt_confirmations=%d "
             "interrupt_min_speech_ms=%d interrupt_window_ms=%d "
-            "force_interrupt=disabled tts_pacing=%s",
+            "force_interrupt=disabled tts_pacing=%s classifier_window_ms=%d",
             self.session_id,
             self.settings.interrupt_confirmations,
             self.settings.interrupt_min_speech_ms,
             self.settings.interrupt_window_ms,
             ("input_audio_clock" if self.settings.tts_realtime_pacing else "disabled"),
+            self._classifier_window_bytes() * 1000 // 8000,
         )
 
     async def close(self) -> None:
         self.closed = True
+        self.debug_classifier_inputs.clear()
+        self.debug_resume.set()
         self.tts_playback_allowed.set()
         async with self.input_audio_clock:
             self.input_audio_clock.notify_all()
@@ -581,7 +605,61 @@ class RealtimeSession:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def handle(self, message: dict[str, Any]) -> None:
+        self.last_client_event_at = time.perf_counter()
         event_type = message.get("type")
+        if event_type == "debug.ping" and self.debug_enabled:
+            await self.send(_event(
+                "debug.pong", client_time_ms=message.get("client_time_ms"),
+                audio_clock_ms=self.received_audio_bytes * 1000 // 8000,
+            ))
+            return
+        if event_type == "debug.classifier.inspect" and self.debug_enabled:
+            request_id = message.get("request_id")
+            messages = self.debug_classifier_inputs.get(request_id)
+            await self.send(_event(
+                "debug.classifier.input", request_id=request_id,
+                messages=messages, error=None if messages is not None else "Input expired; only the latest 20 requests are retained",
+            ))
+            return
+        if event_type in {"debug.pause", "debug.resume"} and self.debug_enabled:
+            self.debug_paused = event_type == "debug.pause"
+            now = time.perf_counter()
+            logger.info(
+                "session=%s debug %s audio_clock_ms=%d pause_duration_ms=%.1f",
+                self.session_id, "paused" if self.debug_paused else "resumed",
+                self.received_audio_bytes * 1000 // 8000,
+                (now - self.debug_paused_at) * 1000 if self.debug_paused_at is not None else 0,
+            )
+            self.debug_paused_at = now if self.debug_paused else None
+            if self.debug_paused:
+                self.debug_resume.clear()
+            else:
+                self.debug_resume.set()
+            await self.send(_event(
+                "debug.pause.updated", paused=self.debug_paused,
+                audio_clock_ms=self.received_audio_bytes * 1000 // 8000,
+            ))
+            if self.debug_paused:
+                # Large buffers are sent once on inspection, not on every vote.
+                await self.send(_event(
+                    "debug.pause.snapshot",
+                    audio_clock_ms=self.received_audio_bytes * 1000 // 8000,
+                    buffers={
+                        "candidate": audio_message(bytes(self.input_pcm)),
+                        "ignorable": audio_message(bytes(self.ignorable_pcm)),
+                        "interrupt": audio_message(
+                            ulaw_to_pcm16(self._interrupt_audio_window())[0]
+                        ),
+                    },
+                ))
+            if not self.debug_paused:
+                self._schedule_classification()
+                self._start_deferred_response()
+            return
+        if self.debug_paused:
+            # Packets already queued in the socket must not advance the clock
+            # or change the buffered turn during inspection.
+            return
         if event_type == "session.update":
             await self._session_update(message.get("session", {}))
         elif event_type == "input_audio_buffer.append":
@@ -617,6 +695,8 @@ class RealtimeSession:
                 self._schedule_user_commit()
 
     async def _session_update(self, session: dict[str, Any]) -> None:
+        self.debug_enabled = session.get("debug", self.debug_enabled) is True
+        self.debug_audio_on_demand = session.get("debug_audio_mode") == "on_demand"
         self.base_instructions = session.get("instructions") or self.base_instructions
         self.hotword_domain = detect_hotword_domain(self.base_instructions)
         if self.hotword_domain is None:
@@ -641,6 +721,7 @@ class RealtimeSession:
         play_greeting = not self.greeting_sent
         self.history = [{"role": "system", "content": self.instructions}]
         self.interaction_history.clear()
+        self.ignorable_pcm.clear()
         if self.settings.greeting.strip():
             self.greeting_sent = True
         raw_tools = session.get("tools", [])
@@ -758,7 +839,7 @@ class RealtimeSession:
                 self._start_next_pending_user_turn()
 
     async def _append_audio(self, encoded: str) -> None:
-        if not encoded:
+        if self.debug_paused or not encoded:
             return
         try:
             audio = base64.b64decode(encoded)
@@ -766,6 +847,7 @@ class RealtimeSession:
             await self.send(_error_event("invalid_audio", str(exc)))
             return
         await self._advance_input_audio_clock(len(audio))
+        self.last_audio_received_at = time.perf_counter()
         if self.received_audio_bytes == len(audio):
             logger.info(
                 "session=%s received first audio packet bytes=%d",
@@ -831,6 +913,7 @@ class RealtimeSession:
         if (
             self.speech_seen
             and not self.assistant_speaking
+            and self.semantic_turn_started
             and self.candidate_silence_ms >= self.settings.silence_ms
         ):
             self._schedule_user_commit()
@@ -854,6 +937,7 @@ class RealtimeSession:
         )
         if (
             self.closed
+            or self.debug_paused
             or self.user_turn_processing
             or (self.user_commit_task and not self.user_commit_task.done())
             or not self.speech_seen
@@ -902,7 +986,43 @@ class RealtimeSession:
         candidate_speech_ms: int,
     ) -> None:
         started_at = time.perf_counter()
+        request_id = f"cls_{uuid.uuid4().hex}"
+        kind = "interrupt" if interrupt else "semantic_complete"
+        choices = (
+            ["interrupt", "backchannel", "ignorable"]
+            if interrupt
+            else (
+                ["complete", "incomplete"]
+                if self.semantic_turn_started
+                else ["ignorable", "incomplete", "complete"]
+            )
+        )
+        status = "error"
+        label = None
+        error = None
         try:
+            if self.debug_enabled:
+                if self.debug_audio_on_demand:
+                    self.debug_classifier_inputs[request_id] = messages
+                    while len(self.debug_classifier_inputs) > 20:
+                        del self.debug_classifier_inputs[next(iter(self.debug_classifier_inputs))]
+                await self.send(_event(
+                    "debug.classifier.started",
+                    request_id=request_id,
+                    kind=kind,
+                    model=self.settings.interactive_model,
+                    messages=None if self.debug_audio_on_demand else messages,
+                    choices=choices,
+                    audio_clock_ms=scheduled_audio_clock * 1000 // 8000,
+                    audio_ms=len(classifier_pcm) * 1000 // 32000,
+                    candidate_audio_ms=candidate_audio_ms,
+                    candidate_speech_ms=candidate_speech_ms,
+                    input_generation=generation,
+                    buffer_audio_ms={
+                        "candidate": len(self.input_pcm) * 1000 // 32000,
+                        "ignorable": len(self.ignorable_pcm) * 1000 // 32000,
+                    },
+                ))
             if interrupt:
                 logger.info(
                     "session=%s requesting interrupt classification "
@@ -915,7 +1035,7 @@ class RealtimeSession:
                 self.interrupt_classification_attempts += 1
                 label = await self.interactive.classify(
                     messages,
-                    ["interrupt", "backchannel", "ignorable"],
+                    choices,
                 )
                 logger.info(
                     "session=%s interrupt classification=%s latency_ms=%.1f "
@@ -926,13 +1046,17 @@ class RealtimeSession:
                     (self.received_audio_bytes - scheduled_audio_clock) * 1000 // 8000,
                 )
                 await self.classifier_debug.save(classifier_pcm, "interrupt", label)
+                await self._debug_classifier_prediction(request_id, label, started_at)
+                await self.debug_resume.wait()
                 if generation != self.input_generation or not self.speech_seen:
+                    status = "discarded_stale"
                     logger.info(
                         "session=%s discarding stale interrupt classification",
                         self.session_id,
                     )
                     return
                 if not self.assistant_active:
+                    status = "discarded_assistant_idle"
                     logger.info(
                         "session=%s discarding interrupt classification after "
                         "assistant became idle",
@@ -940,6 +1064,7 @@ class RealtimeSession:
                     )
                     return
                 await self._apply_interrupt_classification(label)
+                status = "applied"
             else:
                 logger.info(
                     "session=%s requesting completeness classification audio_ms=%d",
@@ -948,7 +1073,7 @@ class RealtimeSession:
                 )
                 label = await self.interactive.classify(
                     messages,
-                    ["complete", "incomplete"],
+                    choices,
                 )
                 logger.info(
                     "session=%s completeness classification=%s latency_ms=%.1f "
@@ -959,35 +1084,37 @@ class RealtimeSession:
                     (self.received_audio_bytes - scheduled_audio_clock) * 1000 // 8000,
                 )
                 await self.classifier_debug.save(classifier_pcm, "semantic", label)
+                await self._debug_classifier_prediction(request_id, label, started_at)
+                await self.debug_resume.wait()
                 if generation != self.input_generation or not self.speech_seen:
+                    status = "discarded_stale"
                     logger.info(
                         "session=%s discarding stale completeness classification",
                         self.session_id,
                     )
                     return
                 if self.assistant_active:
+                    status = "discarded_assistant_active"
                     logger.info(
                         "session=%s discarding completeness classification after "
                         "assistant became active",
                         self.session_id,
                     )
                     return
-                if label == "complete":
-                    self.consecutive_complete_count += 1
-                    logger.info(
-                        "session=%s completeness confirmations=%d/%d",
-                        self.session_id,
-                        self.consecutive_complete_count,
-                        self.settings.complete_confirmations,
-                    )
-                    if (
-                        self.consecutive_complete_count
-                        >= self.settings.complete_confirmations
-                    ):
-                        self._schedule_user_commit()
-                else:
-                    self.consecutive_complete_count = 0
+                self._apply_completeness_classification(
+                    label,
+                    classified_pcm_bytes=len(classifier_pcm),
+                    classified_audio_ms=candidate_audio_ms,
+                )
+                status = "applied"
         except Exception as exc:
+            error = str(exc)
+            if self.debug_enabled:
+                await self.send(_event(
+                    "debug.classifier.failed", request_id=request_id,
+                    error=error,
+                ))
+            await self.debug_resume.wait()
             # Classifier failures are handled by the silence timeout path.
             self.consecutive_interrupt_count = 0
             self.interrupt_votes.clear()
@@ -997,10 +1124,32 @@ class RealtimeSession:
             logger.exception("session=%s classifier failed", self.session_id)
             await self.send(_error_event("classifier_error", str(exc)))
         finally:
+            if self.debug_enabled and not self.closed:
+                await self.send(_event(
+                    "debug.classifier.finished", request_id=request_id,
+                    label=label, status=status, error=error,
+                    state={
+                        "complete_count": self.consecutive_complete_count,
+                        "interrupt_votes": list(self.interrupt_votes),
+                        "semantic_turn_started": self.semantic_turn_started,
+                        "candidate_audio_ms": len(self.input_pcm) * 1000 // 32000,
+                        "ignorable_audio_ms": len(self.ignorable_pcm) * 1000 // 32000,
+                    },
+                ))
             self.classification_running = False
             self.classifier_task = None
             self._schedule_classification()
             self._start_deferred_response()
+
+    async def _debug_classifier_prediction(
+        self, request_id: str, label: str, started_at: float
+    ) -> None:
+        if self.debug_enabled:
+            await self.send(_event(
+                "debug.classifier.predicted", request_id=request_id, label=label,
+                latency_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                awaiting_resume=self.debug_paused,
+            ))
 
     def _interrupt_window_bytes(self) -> int:
         return max(1, self.settings.interrupt_window_ms * 8000 // 1000)
@@ -1093,22 +1242,115 @@ class RealtimeSession:
         self.pre_roll_ulaw.extend(trailing_audio)
         self._start_deferred_response()
 
+    def _apply_completeness_classification(
+        self,
+        label: str,
+        classified_pcm_bytes: int | None = None,
+        classified_audio_ms: int | None = None,
+    ) -> None:
+        """Advance the semantic-turn state from one classifier result."""
+        if label == "ignorable" and not self.semantic_turn_started:
+            prefix_pcm_bytes = min(
+                len(self.input_pcm),
+                len(self.input_pcm)
+                if classified_pcm_bytes is None
+                else classified_pcm_bytes,
+            )
+            retained_ms = prefix_pcm_bytes * 1000 // 32000
+            self._remember_ignorable_audio(bytes(self.input_pcm[:prefix_pcm_bytes]))
+            logger.info(
+                "session=%s retained ignorable audio_ms=%d total_ms=%d",
+                self.session_id,
+                retained_ms,
+                len(self.ignorable_pcm) * 1000 // 32000,
+            )
+            self._discard_ignorable_prefix(
+                prefix_pcm_bytes,
+                retained_ms if classified_audio_ms is None else classified_audio_ms,
+            )
+            self._start_deferred_response()
+            return
+
+        if label == "incomplete":
+            self.semantic_turn_started = True
+            self.consecutive_complete_count = 0
+            if self.candidate_silence_ms >= self.settings.silence_ms:
+                logger.info(
+                    "session=%s forcing incomplete turn complete after silence_ms=%d",
+                    self.session_id,
+                    self.candidate_silence_ms,
+                )
+                self._schedule_user_commit()
+            return
+
+        if label != "complete":
+            raise ValueError(f"unexpected semantic completeness label: {label!r}")
+
+        self.semantic_turn_started = True
+        self.consecutive_complete_count += 1
+        logger.info(
+            "session=%s completeness confirmations=%d/%d",
+            self.session_id,
+            self.consecutive_complete_count,
+            self.settings.complete_confirmations,
+        )
+        if self.consecutive_complete_count >= self.settings.complete_confirmations:
+            self._schedule_user_commit()
+
+    def _discard_ignorable_prefix(self, pcm_bytes: int, audio_ms: int) -> None:
+        """Remove only the audio covered by an ignorable classifier snapshot."""
+        del self.input_pcm[:pcm_bytes]
+        ulaw_bytes = min(len(self.input_ulaw), max(0, audio_ms * 8))
+        del self.input_ulaw[:ulaw_bytes]
+        self.candidate_speech_ms = max(0, self.candidate_speech_ms - audio_ms)
+        if not self.input_pcm:
+            self._clear_input()
+            return
+        self.input_generation += 1
+        self.consecutive_complete_count = 0
+        self.semantic_turn_started = False
+        # Audio received while classification was in flight remains an active
+        # candidate. tick_audio already contains exactly that newer suffix.
+        self.speech_seen = True
+        self.speech_start_ms = max(
+            0,
+            (self.received_audio_bytes - len(self.input_ulaw)) * 1000 // 8000,
+        )
+
+    def _remember_ignorable_audio(self, pcm: bytes) -> None:
+        max_bytes = max(0, self.settings.ignorable_audio_max_s * 32000)
+        if max_bytes == 0:
+            self.ignorable_pcm.clear()
+            return
+        self.ignorable_pcm.extend(pcm)
+        if len(self.ignorable_pcm) > max_bytes:
+            del self.ignorable_pcm[:-max_bytes]
+
     def _classifier_messages(self, pcm: bytes, interrupt: bool) -> list[dict[str, Any]]:
+        history = list(self.interaction_history)
+        user_content: list[dict[str, Any]] = []
         if interrupt:
             prompt = INTERRUPT_SYSTEM_PROMPT
             query = INTERRUPT_QUERY
+            # The active assistant turn is not in interaction_history yet. Its
+            # preceding user audio and the current window therefore share one
+            # user message, just as adjacent users are merged in ms-swift data.
+            if history and history[-1]["role"] == "user":
+                preceding_user = history.pop()
+                user_content.extend(preceding_user["content"])
+                query = "\n" + query
         else:
             prompt = COMPLETE_SYSTEM_PROMPT
             query = COMPLETE_QUERY
+        user_content.extend(
+            [{"type": "text", "text": query}, audio_message(pcm)]
+        )
         return [
             {"role": "system", "content": prompt},
-            *self.interaction_history,
+            *history,
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": query},
-                    audio_message(pcm),
-                ],
+                "content": user_content,
             },
         ]
 
@@ -1131,6 +1373,7 @@ class RealtimeSession:
     def _schedule_user_commit(self) -> None:
         if (
             self.closed
+            or self.debug_paused
             or self.user_turn_processing
             or not self.speech_seen
             or not self.input_pcm
@@ -1147,6 +1390,7 @@ class RealtimeSession:
             self._start_deferred_response()
 
     async def _commit_user_audio(self) -> None:
+        await self.debug_resume.wait()
         if self.user_turn_processing or not self.speech_seen or not self.input_pcm:
             return
         pcm = bytes(self.input_pcm)
@@ -1265,6 +1509,7 @@ class RealtimeSession:
         self.speech_seen = False
         self.speech_start_ms = None
         self.consecutive_complete_count = 0
+        self.semantic_turn_started = False
         self.consecutive_interrupt_count = 0
         self.interrupt_confirmed = False
         self.interrupt_negative_count = 0
@@ -1588,6 +1833,8 @@ class RealtimeSession:
         self._start_deferred_response()
 
     def _start_deferred_response(self) -> None:
+        if self.debug_paused:
+            return
         current_task = asyncio.current_task()
         response_in_progress = bool(
             self.response_task

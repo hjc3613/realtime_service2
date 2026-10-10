@@ -2,8 +2,19 @@
 
 This is a small OpenAI-Realtime-compatible WebSocket facade for tau2's current
 OpenAI provider. It accepts 8 kHz mono mu-law audio and emits the same format.
-Interactive classification and ASR use the request shape in
-`interactive_demo/{interrupt,semantic_complete,asr_val}.jsonl`.
+Interactive classification uses the exact system prompts and message layout in
+`new_interactive_assets/ms_swift/{interrupt,semantic_complete}/train.jsonl`.
+Each `<audio>` is converted to an `audio_url` block using the same ordering and
+text boundaries as `new_interactive_assets/evaluate_duplex.py`.
+During interruption detection, the last historical user audio is merged into
+the final user message as audio, `\nstage=speaking; classify the current audio
+window.\n`, then current-window audio. The unfinished assistant response is not
+included. Without a preceding user, the final message contains the stage text
+and current audio only. Semantic completion uses `stage=idle; classify the
+current accumulated audio.` followed by the accumulated audio. The trained
+interrupt prompt lists `ignorable` and `interrupt`; the service continues to
+accept `backchannel` through its output choices and interruption state machine
+for compatibility with models that produce it.
 
 Install the standalone dependencies and run from the repository root:
 
@@ -17,6 +28,55 @@ debugger. It can configure a session, stream microphone audio as 8 kHz G.711
 mu-law, play response audio, inspect raw events, manually commit a turn, and
 return function-call results. The client keeps sending silent audio packets while
 the microphone is off so that input-clock-paced TTS can continue to play.
+
+The browser opts into per-session debug events with `session.debug=true`.
+The **Audio** tab records each interaction-model request, label choices,
+prediction, latency, and whether the result was applied or discarded. The browser
+sets `session.debug_audio_mode="on_demand"`: full WAV/Base64 messages stay on the
+server until **加载本次完整输入与试听音频** is clicked. This avoids repeatedly
+transmitting accumulated audio and history over an SSH tunnel. Inputs for the
+latest 20 requests are retained in memory; load an input before exporting its
+JSON. Other debug clients can omit this option to keep inline messages.
+Audio players expose the classified window/accumulated
+audio, preceding user voice context, and historical user audio. Pausing sends
+one separate snapshot of the current candidate, ignorable buffer, and interrupt
+window. Large caches are not retransmitted with every prediction. A reviewer can choose an expected
+label and export the request, audio data URLs, prediction, and annotation as
+JSON. These annotations are local to the page; they do not change inference.
+The page keeps the most recent 20 requests in memory.
+
+The microphone upload queue keeps at most two 200 ms packets and drains both
+on the next tick if needed. During congestion it discards the oldest unsent
+microphone packets instead of replaying seconds of stale audio; `INPUT QUEUE`
+shows queued duration, WebSocket buffered bytes, heartbeat RTT, scheduled
+playback duration, and discarded packet count. While microphone capture is
+healthy, an empty upload tick waits for captured audio instead of adding an
+extra silent packet. Synthetic silence is used when the microphone is off or
+capture has stalled for 400 ms. Confirmed interruption clears audio already
+scheduled in the browser, including a pending AudioContext resume.
+Uploads stop adding audio while the socket has at least 8 KiB buffered. Debug
+heartbeats continue every five seconds even during pause, so pausing the audio
+does not leave the connection entirely idle. Actual closure is recorded with
+its code and reason in Events and the conversation display.
+
+`start.sh` defaults to a 400 ms classifier window (`200 ms × 2`); set
+`CLASSIFIER_WINDOW_TICKS` in the environment to override it. This cadence and
+the confirmation counts add delay beyond the logged model-request latency.
+Interrupt detection still requires 800 ms of VAD speech before its first vote.
+The startup log includes the effective classifier window. Pause/resume and
+disconnect logs include session IDs, pause state, close reason, and input idle
+time to distinguish paused audio from a lost transport. Heartbeat RTT measures
+the browser-to-service round trip, including SSH forwarding and event handling;
+classifier latency measures the service-side request path.
+
+Click **暂停检查** to stop microphone uploads and silent clock packets and
+suspend live assistant playback. The server acknowledges `debug.pause`, ignores
+subsequent audio packets, and holds normal output. In-flight model requests may
+finish; classifier predictions remain visible but are applied only after
+**继续运行** (`debug.resume`). Review audio players remain usable while paused.
+Input buffers and conversation history are preserved, and audio captured during
+the pause is not replayed on resume. Debug events and pause controls are enabled
+only for sessions that explicitly opt in, independently of debug WAV recording.
 
 Environment variables:
 
@@ -74,8 +134,15 @@ current Kubernetes TTS service). No local TTS proxy is required.
 Semantic completeness is classified on each configured audio window without a VAD
 trailing-silence prerequisite. The service requires `COMPLETE_CONFIRMATIONS`
 consecutive `complete` classifications (two by default) before committing a user
-turn. An `incomplete` classification resets the count. If semantic completion is not confirmed, it
-commits after `END_SILENCE_MS` (3 seconds by default). Set
+turn. Before a target-user turn starts, `ignorable` identifies noise, non-speech,
+or speech not addressed to the assistant. That audio is removed from the active
+turn and retained in a separate rolling PCM buffer capped by
+`IGNORABLE_AUDIO_MAX_S` (15 seconds by default). The first `incomplete` result
+locks the active target-user turn; subsequent classifications are constrained to
+`incomplete` or `complete`, so the turn cannot fall back to `ignorable`. An
+`incomplete` classification resets the completion count. Once locked, the turn
+is committed after `END_SILENCE_MS` of continuous silence (3 seconds by default)
+even if the classifier never returns `complete`. Set
 `INTERRUPT_ENABLED=false` to ignore all user audio while the assistant is
 speaking and let the response finish without interruption. It buffers two
 200 ms ticks between classifier calls. Interrupt classification uses the latest
@@ -174,6 +241,12 @@ endpoints intentionally require those environment proxies.
 `TEXT_STREAMING=true` sends comma- or sentence-terminated text chunks to TTS
 while the LLM is still generating. Tool-call deltas are buffered and emitted
 only after the full name and arguments have been assembled.
+Standalone punctuation/quote fragments are excluded from TTS, including when
+they arrive in a separate streaming delta after a sentence boundary. The
+pre-production TTS endpoint returns an upstream-stream 502 for inputs such as
+`”；`; the complete assistant text remains unchanged. TTS HTTP errors include
+the upstream response body, model, voice, input length, and `x-request-id` for
+tracing failures at the gateway.
 
 ## Use the local TTS for tau-voice users
 

@@ -153,6 +153,9 @@ class Settings:
     vad_pre_roll_ms: int = int(os.getenv("VAD_PRE_ROLL_MS", "300"))
     silence_ms: int = int(os.getenv("END_SILENCE_MS", "3000"))
     complete_confirmations: int = int(os.getenv("COMPLETE_CONFIRMATIONS", "2"))
+    # Keep recent audio that the interaction model identifies as not addressed
+    # to the assistant. This is deliberately separate from the active user turn.
+    ignorable_audio_max_s: int = int(os.getenv("IGNORABLE_AUDIO_MAX_S", "15"))
     interrupt_enabled: bool = _env_bool("INTERRUPT_ENABLED", True)
     classifier_timeout_s: float = float(os.getenv("CLASSIFIER_TIMEOUT_S", "3"))
     classifier_max_tokens: int = int(os.getenv("CLASSIFIER_MAX_TOKENS", "5"))

@@ -229,3 +229,5 @@ data/simulations/.credentials/
 # Cursor IDE
 .cursor/
 *asr_debug*
+*new_interactive_assets*
+*nohup*

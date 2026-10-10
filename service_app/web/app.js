@@ -9,6 +9,8 @@
     commit:$("commitButton"),speaker:$("speakerButton"),eventList:$("eventList"),
     eventFilter:$("eventFilter"),rawEvent:$("rawEvent"),sendRaw:$("sendRawButton"),
     instructions:$("instructions"),toolsJson:$("toolsJson"),updateSession:$("updateSessionButton"),
+    pause:$("pauseButton"),classifierRecords:$("classifierRecords"),reviewSummary:$("reviewSummary"),
+    inputQueue:$("inputQueueMetric"),pauseBuffers:$("pauseBuffers"),
     toolCalls:$("toolCalls"),toolEmpty:$("toolEmpty"),toolBadge:$("toolBadge"),toasts:$("toastRegion")
   };
   const state = {
@@ -16,8 +18,12 @@
     processor:null,source:null,microphoneOn:false,muted:false,clockTimer:null,
     captureSamples:[],capturePackets:[],nextPlaybackAt:0,eventCount:0,
     audioUpBytes:0,audioDownBytes:0,micFrames:0,micPacketsSent:0,
-    messages:new Map(),pendingTools:new Map()
+    messages:new Map(),pendingTools:new Map(),paused:false,pausePending:false,classifiers:new Map(),
+    heartbeatTimer:null,droppedPackets:0,pauseSnapshot:null,lastCaptureAt:null,
+    playbackSources:new Set(),playbackGeneration:0,heartbeatRttMs:null
   };
+  const MAX_CAPTURE_PACKETS = 2;
+  const MAX_SOCKET_AUDIO_BYTES = 8192;
 
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   el.serverUrl.value = `${protocol}//${location.host}/v1/realtime`;
@@ -27,8 +33,9 @@
     el.state.querySelector("span").textContent = text;
   }
   function setControls(connected) {
-    el.connect.querySelector("span:last-child").textContent = connected ? "Disconnect" : "Connect";
-    [el.mic, el.commit, el.sendRaw, el.updateSession].forEach((node) => { node.disabled = !connected; });
+    el.connect.querySelector("span:last-child").textContent = connected ? "断开连接" : "Connect";
+    [el.mic, el.commit, el.sendRaw, el.updateSession].forEach((node) => { node.disabled = !connected || state.paused; });
+    el.pause.disabled = !connected || state.pausePending;
   }
   function toast(message, error = false) {
     const node = document.createElement("div");
@@ -38,7 +45,12 @@
     setTimeout(() => node.remove(), 4200);
   }
   function displayEvent(event) {
-    const copy = JSON.parse(JSON.stringify(event));
+    const copy = JSON.parse(JSON.stringify(event, (key, value) => {
+      if (key === "url" && typeof value === "string" && value.startsWith("data:audio/")) {
+        return `<audio URL · ${value.length} chars · 在 Audio 标签试听>`;
+      }
+      return value;
+    }));
     if (typeof copy.audio === "string") copy.audio = `<base64 audio · ${copy.audio.length} chars>`;
     if (event.type === "response.output_audio.delta" && typeof copy.delta === "string") {
       copy.delta = `<base64 audio · ${copy.delta.length} chars>`;
@@ -97,6 +109,15 @@
     const ws = new WebSocket(url);
     state.ws = ws;
     ws.addEventListener("open", async () => {
+      state.paused = false;
+      state.pausePending = false;
+      state.droppedPackets = 0;
+      state.audioUpBytes = 0;
+      state.audioDownBytes = 0;
+      state.heartbeatRttMs = null;
+      el.pause.textContent = "暂停检查";
+      el.pause.setAttribute("aria-pressed", "false");
+      clearClassifierRecords();
       el.connect.disabled = false;
       state.connectedAt = performance.now();
       state.firstResponseAt = 0;
@@ -105,6 +126,8 @@
       await ensureAudioContext();
       startAudioClock();
       updateSession();
+      if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+      state.heartbeatTimer = setInterval(() => send({type:"debug.ping",client_time_ms:performance.now()}, true), 5000);
       toast("Realtime connection established");
     });
     ws.addEventListener("message", (message) => {
@@ -115,13 +138,24 @@
     });
     ws.addEventListener("error", () => toast("WebSocket connection error", true));
     ws.addEventListener("close", (event) => {
+      if (state.ws !== ws) return;
       el.connect.disabled = false;
       if (state.ws === ws) state.ws = null;
       stopAudioClock();
+      if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+      state.heartbeatTimer = null;
       stopMicrophone();
+      stopPlayback();
+      state.paused = false;
+      state.pausePending = false;
+      if (state.audioContext?.state === "suspended") state.audioContext.resume();
+      el.pause.textContent = "暂停检查";
+      el.pause.setAttribute("aria-pressed", "false");
       setConnection("offline", "OFFLINE");
       setControls(false);
       el.session.textContent = "—";
+      logEvent("server", {type:"debug.connection.closed",code:event.code,reason:event.reason || "",was_clean:event.wasClean});
+      addMessage("system", null, `连接已关闭：${event.code}${event.reason ? ` · ${event.reason}` : ""}`, false);
       if (event.code !== 1000) toast(`Connection closed (${event.code || "no code"})`, true);
     });
   }
@@ -132,7 +166,7 @@
       tools = JSON.parse(el.toolsJson.value || "[]");
       if (!Array.isArray(tools)) throw new Error("Tools must be a JSON array");
     } catch (error) { toast(`Invalid tools JSON: ${error.message}`, true); return; }
-    send({type:"session.update", session:{instructions:el.instructions.value, tools}});
+    send({type:"session.update", session:{instructions:el.instructions.value, tools, debug:true, debug_audio_mode:"on_demand"}});
   }
 
   function handleEvent(event) {
@@ -141,6 +175,47 @@
       el.latency.textContent = `${Math.round(state.firstResponseAt - state.connectedAt)}ms`;
     }
     switch (event.type) {
+      case "debug.pong":
+        if (typeof event.client_time_ms === "number") {
+          state.heartbeatRttMs = Math.round(performance.now() - event.client_time_ms);
+          updateInputQueue();
+        }
+        break;
+      case "debug.pause.snapshot":
+        state.pauseSnapshot = event;
+        el.pauseBuffers.textContent = "";
+        const heading = document.createElement("h3");
+        heading.textContent = `暂停现场 · 服务端音频时钟 ${(event.audio_clock_ms / 1000).toFixed(1)}s`;
+        el.pauseBuffers.append(heading);
+        addDebugAudio(el.pauseBuffers, "暂停时累计的候选音频", event.buffers.candidate);
+        addDebugAudio(el.pauseBuffers, "暂停时保留的 ignorable 环境音", event.buffers.ignorable);
+        addDebugAudio(el.pauseBuffers, "暂停时的打断滑动窗口", event.buffers.interrupt);
+        break;
+      case "debug.pause.updated":
+        state.pausePending = false;
+        state.paused = event.paused;
+        el.pause.textContent = state.paused ? "继续运行" : "暂停检查";
+        el.pause.setAttribute("aria-pressed", String(state.paused));
+        setControls(true);
+        setConnection(state.paused ? "paused" : "online", state.paused ? "PAUSED" : "ONLINE");
+        if (state.paused) {
+          showTab("audio");
+          el.micHint.textContent = "已暂停接收 · 可试听判定音频";
+        } else {
+          state.captureSamples = []; state.capturePackets = [];
+          state.lastCaptureAt = performance.now();
+          state.mediaStream?.getAudioTracks().forEach((track) => { track.enabled = true; });
+          state.audioContext?.resume();
+          document.querySelectorAll(".debug-audio audio").forEach((audio) => audio.pause());
+        }
+        break;
+      case "debug.classifier.started":
+      case "debug.classifier.predicted":
+      case "debug.classifier.finished":
+      case "debug.classifier.failed":
+      case "debug.classifier.input":
+        renderClassifier(event);
+        break;
       case "session.created":
         el.session.textContent = event.session?.id || "local";
         break;
@@ -156,7 +231,9 @@
       case "response.text.done":
         finishAssistant(event.item_id, event.text);
         break;
+      case "input_audio_buffer.speech_started":
       case "response.cancelled":
+        stopPlayback();
         markInterrupted();
         break;
       case "response.output_audio.delta":
@@ -244,7 +321,7 @@
     if (!state.audioContext || state.audioContext.state === "closed") {
       state.audioContext = new (window.AudioContext || window.webkitAudioContext)();
     }
-    return state.audioContext.resume();
+    return state.paused ? Promise.resolve() : state.audioContext.resume();
   }
   async function toggleMicrophone() {
     if (state.microphoneOn) {
@@ -272,6 +349,7 @@
       });
       state.micFrames = 0;
       state.micPacketsSent = 0;
+      state.lastCaptureAt = performance.now();
       state.source = state.audioContext.createMediaStreamSource(state.mediaStream);
       state.processor = state.audioContext.createScriptProcessor(2048, 1, 1);
       const silentGain = state.audioContext.createGain();
@@ -301,6 +379,7 @@
   }
   function stopMicrophone() {
     state.microphoneOn = false;
+    state.lastCaptureAt = null;
     state.captureSamples = [];
     state.capturePackets = [];
     if (state.processor) { state.processor.disconnect(); state.processor.onaudioprocess = null; }
@@ -313,7 +392,8 @@
     el.inputLevel.style.width = "0";
   }
   function captureAudio(event) {
-    if (!state.microphoneOn) return;
+    if (!state.microphoneOn || state.paused) return;
+    state.lastCaptureAt = performance.now();
     state.micFrames += 1;
     const input = event.inputBuffer.getChannelData(0);
     let sum = 0;
@@ -328,6 +408,12 @@
       for (let i = 0; i < frame.length; i++) encoded[i] = linearToUlaw(frame[i]);
       state.capturePackets.push(encoded);
     }
+    if (state.capturePackets.length > MAX_CAPTURE_PACKETS) {
+      const dropped = state.capturePackets.length - MAX_CAPTURE_PACKETS;
+      state.capturePackets.splice(0, dropped);
+      state.droppedPackets += dropped;
+    }
+    updateInputQueue();
   }
   function resample(input, fromRate, toRate) {
     if (fromRate === toRate) return input;
@@ -377,17 +463,30 @@
     const silence = new Uint8Array(1600);
     silence.fill(0xff);
     const tick = () => {
-      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
-      const hasMicPacket = state.microphoneOn && state.capturePackets.length > 0;
-      const packet = hasMicPacket ? state.capturePackets.shift() : silence;
-      if (send({type:"input_audio_buffer.append", audio:toBase64(packet)}, true)) {
-        state.audioUpBytes += packet.length;
-        el.audioUp.textContent = `${(state.audioUpBytes / 8000).toFixed(1)}s`;
-        if (hasMicPacket) {
-          state.micPacketsSent += 1;
-          el.micHint.textContent = `Live · ${state.micPacketsSent} voice packets sent`;
+      if (state.paused || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      // Avoid adding seconds of old audio ahead of a pause command in the socket.
+      if (state.ws.bufferedAmount >= MAX_SOCKET_AUDIO_BYTES) {
+        updateInputQueue(); return;
+      }
+      // A live microphone already supplies silence in its captured PCM. Adding
+      // another silent packet while a 200 ms frame is incomplete advances the
+      // server clock ahead of the real microphone and creates playback backlog.
+      const captureStalled = state.lastCaptureAt === null || performance.now() - state.lastCaptureAt >= 400;
+      const packetCount = state.microphoneOn && !captureStalled ? state.capturePackets.length : Math.max(1, state.capturePackets.length);
+      for (let index = 0; index < packetCount; index++) {
+        if (state.ws.bufferedAmount >= MAX_SOCKET_AUDIO_BYTES) break;
+        const hasMicPacket = state.microphoneOn && state.capturePackets.length > 0;
+        const packet = hasMicPacket ? state.capturePackets.shift() : silence;
+        if (send({type:"input_audio_buffer.append", audio:toBase64(packet)}, true)) {
+          state.audioUpBytes += packet.length;
+          el.audioUp.textContent = `${(state.audioUpBytes / 8000).toFixed(1)}s`;
+          if (hasMicPacket) {
+            state.micPacketsSent += 1;
+            el.micHint.textContent = `Live · ${state.micPacketsSent} voice packets sent`;
+          }
         }
       }
+      updateInputQueue();
     };
     tick();
     state.clockTimer = setInterval(tick, 200);
@@ -396,9 +495,27 @@
     if (state.clockTimer) clearInterval(state.clockTimer);
     state.clockTimer = null;
   }
+  function updateInputQueue() {
+    const queuedMs = state.capturePackets.length * 200;
+    const socketBytes = state.ws?.bufferedAmount || 0;
+    const rtt = state.heartbeatRttMs === null ? "—" : `${state.heartbeatRttMs}ms`;
+    const playbackMs = state.audioContext ? Math.max(0, Math.round((state.nextPlaybackAt - state.audioContext.currentTime) * 1000)) : 0;
+    el.inputQueue.textContent = `${queuedMs}ms · WS ${socketBytes}B · RTT ${rtt} · 播放队列 ${playbackMs}ms · 丢弃 ${state.droppedPackets} 包`;
+  }
+  function stopPlayback() {
+    state.playbackGeneration += 1;
+    for (const source of state.playbackSources) {
+      source.stop();
+      source.disconnect();
+    }
+    state.playbackSources.clear();
+    state.nextPlaybackAt = 0;
+  }
   async function receiveAudio(base64) {
     if (!base64) return;
+    const generation = state.playbackGeneration;
     await ensureAudioContext();
+    if (generation !== state.playbackGeneration) return;
     const bytes = fromBase64(base64);
     state.audioDownBytes += bytes.length;
     el.audioDown.textContent = `${(state.audioDownBytes / 8000).toFixed(1)}s`;
@@ -407,6 +524,8 @@
     const channel = buffer.getChannelData(0);
     for (let i = 0; i < bytes.length; i++) channel[i] = ulawToLinear(bytes[i]);
     const source = state.audioContext.createBufferSource();
+    state.playbackSources.add(source);
+    source.onended = () => { state.playbackSources.delete(source); source.disconnect(); };
     source.buffer = buffer;
     source.connect(state.audioContext.destination);
     const startAt = Math.max(state.audioContext.currentTime + 0.025, state.nextPlaybackAt);
@@ -417,6 +536,146 @@
     state.muted = !state.muted;
     el.speaker.setAttribute("aria-pressed", String(state.muted));
     el.speaker.textContent = state.muted ? "Muted" : "Sound on";
+  }
+
+  async function togglePause() {
+    if (state.pausePending) return;
+    state.pausePending = true;
+    el.pause.disabled = true;
+    const resume = state.paused;
+    if (!resume) {
+      // Stop capture and the upload clock immediately, before the server ack.
+      state.paused = true;
+      state.captureSamples = []; state.capturePackets = [];
+      state.mediaStream?.getAudioTracks().forEach((track) => { track.enabled = false; });
+      el.inputLevel.style.width = "0";
+      state.audioContext?.suspend();
+      updateInputQueue();
+      el.pause.textContent = "暂停确认中…";
+    }
+    send({type:resume ? "debug.resume" : "debug.pause"});
+  }
+
+  function addDebugAudio(parent, title, block) {
+    const url = block?.audio_url?.url;
+    if (!url || !url.startsWith("data:audio/")) return;
+    const section = document.createElement("div");
+    section.className = "debug-audio";
+    const label = document.createElement("p");
+    label.textContent = title;
+    const player = document.createElement("audio");
+    player.controls = true; player.preload = "none"; player.src = url;
+    player.addEventListener("play", () => {
+      document.querySelectorAll(".debug-audio audio").forEach((other) => { if (other !== player) other.pause(); });
+    });
+    section.append(label, player); parent.append(section);
+  }
+
+  function clearClassifierRecords() {
+    document.querySelectorAll(".debug-audio audio").forEach((audio) => { audio.pause(); audio.removeAttribute("src"); audio.load(); });
+    el.pauseBuffers.textContent = ""; state.pauseSnapshot = null;
+    state.classifiers.clear(); el.classifierRecords.textContent = "";
+    updateReviewSummary();
+  }
+
+  function updateReviewSummary() {
+    const reviewed = [...state.classifiers.values()].filter((record) => record.expected && record.label);
+    const wrong = reviewed.filter((record) => record.expected !== record.label).length;
+    el.reviewSummary.textContent = `最近 ${state.classifiers.size} 次 · 已标注 ${reviewed.length} · 不符 ${wrong}`;
+  }
+
+  function renderClassifier(event) {
+    if (event.type === "debug.classifier.started") {
+      const card = document.createElement("article"); card.className = "classifier-card";
+      const heading = document.createElement("h3");
+      const result = document.createElement("p"); result.className = "classifier-result";
+      const outcome = document.createElement("pre");
+      const record = {...event, card, heading, result, outcome, label:null, expected:""};
+      state.classifiers.set(event.request_id, record);
+      heading.textContent = `${event.kind === "interrupt" ? "打断" : "语义完整度"} · 输入时钟 ${(event.audio_clock_ms / 1000).toFixed(1)}s · 输入 ${(event.audio_ms / 1000).toFixed(2)}s`;
+      result.textContent = `判断中 · 当前输入 ${(event.audio_ms / 1000).toFixed(2)}s · ${event.model}`;
+      card.append(heading, result, outcome);
+      record.inputArea = document.createElement("div"); card.append(record.inputArea);
+      if (event.messages) {
+        renderClassifierInput(record);
+      } else {
+        const load = document.createElement("button"); load.className = "icon-button";
+        load.textContent = "加载本次完整输入与试听音频";
+        load.addEventListener("click", () => {
+          if (send({type:"debug.classifier.inspect",request_id:event.request_id})) {
+            load.disabled = true; load.textContent = "加载中…";
+          }
+        });
+        record.inputArea.append(load);
+      }
+      const reviewLabel = document.createElement("label"); reviewLabel.textContent = "试听后标注期望标签：";
+      const select = document.createElement("select");
+      ["", ...event.choices].forEach((label) => {
+        const option = document.createElement("option"); option.value = label;
+        option.textContent = label || "未标注"; select.append(option);
+      });
+      select.addEventListener("change", () => {
+        record.expected = select.value;
+        updateClassifierResult(record); updateReviewSummary();
+      });
+      reviewLabel.append(select); card.append(reviewLabel);
+      const download = document.createElement("button"); download.className = "icon-button"; download.textContent = "导出输入及标注 JSON";
+      record.download = download; download.disabled = !record.messages;
+      download.addEventListener("click", () => {
+        const blob = new Blob([JSON.stringify({request_id:record.request_id,kind:record.kind,model:record.model,
+          messages:record.messages,choices:record.choices,buffer_audio_ms:record.buffer_audio_ms,pause_snapshot:state.pauseSnapshot,label:record.label,
+          expected:record.expected,status:record.status,error:record.error,audio_clock_ms:record.audio_clock_ms}, null, 2)], {type:"application/json"});
+        const url = URL.createObjectURL(blob); const link = document.createElement("a");
+        link.href = url; link.download = `${record.request_id}.json`; link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      });
+      card.append(download); el.classifierRecords.prepend(card);
+      while (state.classifiers.size > 20) {
+        const key = state.classifiers.keys().next().value;
+        const old = state.classifiers.get(key);
+        old.card.querySelectorAll("audio").forEach((audio) => { audio.pause(); audio.removeAttribute("src"); audio.load(); });
+        old.card.remove(); state.classifiers.delete(key);
+      }
+    } else {
+      const record = state.classifiers.get(event.request_id);
+      if (!record) return;
+      if (event.type === "debug.classifier.input") {
+        if (event.messages) {
+          record.messages = event.messages;
+          renderClassifierInput(record); record.download.disabled = false;
+        } else {
+          record.inputArea.textContent = event.error;
+        }
+        return;
+      }
+      Object.assign(record, event);
+      updateClassifierResult(record);
+      if (event.state) record.outcome.textContent = JSON.stringify(event.state, null, 2);
+    }
+    updateReviewSummary();
+  }
+
+  function renderClassifierInput(record) {
+    record.inputArea.textContent = "";
+    const content = record.messages.at(-1)?.content || [];
+    const audioBlocks = Array.isArray(content) ? content.filter((block) => block.type === "audio_url") : [];
+    audioBlocks.forEach((block, index) => addDebugAudio(record.inputArea,
+      index === audioBlocks.length - 1 ? "本次分类输入音频" : "上一轮用户音频（声音上下文）", block));
+    const details = document.createElement("details");
+    const summary = document.createElement("summary"); summary.textContent = "完整输入消息与其他音频";
+    details.append(summary);
+    record.messages.slice(0, -1).forEach((message, index) => {
+      if (Array.isArray(message.content)) message.content.forEach((block) => addDebugAudio(details, `历史消息 ${index} · ${message.role}`, block));
+    });
+    const json = document.createElement("pre");
+    json.textContent = JSON.stringify(displayEvent({messages:record.messages,choices:record.choices}), null, 2);
+    details.append(json); record.inputArea.append(details);
+  }
+
+  function updateClassifierResult(record) {
+    const review = record.expected && record.label ? (record.expected === record.label ? " · 符合预期" : ` · 不符（期望 ${record.expected}）`) : " · 未标注";
+    record.result.textContent = `${record.label || (record.error ? "请求失败" : "判断中")} · ${record.latency_ms ?? "—"}ms · ${record.status || (record.awaiting_resume ? "暂停，待应用" : "待应用")}${review}${record.error ? ` · ${record.error}` : ""}`;
+    record.card.dataset.review = !record.expected || !record.label ? "unknown" : record.expected === record.label ? "correct" : "wrong";
   }
   function sendRaw() {
     try { send(JSON.parse(el.rawEvent.value)); }
@@ -429,6 +688,8 @@
   }
 
   el.connect.addEventListener("click", connect);
+  el.pause.addEventListener("click", togglePause);
+  $("clearClassifiers").addEventListener("click", clearClassifierRecords);
   el.mic.addEventListener("click", toggleMicrophone);
   el.commit.addEventListener("click", () => send({type:"input_audio_buffer.commit"}));
   el.speaker.addEventListener("click", toggleMute);
@@ -442,5 +703,5 @@
     el.empty.style.display = "flex";
   });
   document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => showTab(tab.dataset.tab)));
-  window.addEventListener("beforeunload", () => { if (state.ws) state.ws.close(); stopMicrophone(); });
+  window.addEventListener("beforeunload", () => { if (state.ws) state.ws.close(1000, "Debugger page unloading"); stopMicrophone(); stopPlayback(); });
 })();

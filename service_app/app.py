@@ -138,10 +138,15 @@ async def realtime(websocket: WebSocket) -> None:
                 continue
             await session.handle(message)
     except WebSocketDisconnect as exc:
+        now = time.perf_counter()
         logger.info(
-            "WebSocket disconnected client=%s code=%s",
-            client,
-            exc.code,
+            "WebSocket disconnected client=%s session=%s code=%s reason=%s "
+            "paused=%s client_idle_s=%.1f audio_idle_s=%s",
+            client, session.session_id if session else "unknown", exc.code, exc.reason,
+            session.debug_paused if session else False,
+            now - session.last_client_event_at if session else 0,
+            round(now - session.last_audio_received_at, 1)
+            if session and session.last_audio_received_at is not None else None,
         )
     except Exception:
         logger.exception("WebSocket session failed client=%s", client)

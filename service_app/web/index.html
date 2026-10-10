@@ -22,6 +22,7 @@
         <div class="field grow"><label for="serverUrl">WebSocket endpoint</label><input id="serverUrl" autocomplete="off" spellcheck="false" /></div>
         <div class="field model-field"><label for="model">Model</label><input id="model" value="br-voice-realtime" spellcheck="false" /></div>
         <button class="button primary" id="connectButton"><span class="button-dot"></span><span>Connect</span></button>
+        <button class="button secondary" id="pauseButton" disabled aria-pressed="false">暂停检查</button>
       </section>
 
       <section class="metrics" aria-label="connection metrics">
@@ -30,6 +31,7 @@
         <article><span>AUDIO UP</span><strong id="audioUpMetric">0.0s</strong></article>
         <article><span>AUDIO DOWN</span><strong id="audioDownMetric">0.0s</strong></article>
         <article><span>EVENTS</span><strong id="eventMetric">0</strong></article>
+        <article><span>INPUT QUEUE</span><strong id="inputQueueMetric">0ms</strong></article>
       </section>
 
       <div class="workspace">
@@ -59,6 +61,7 @@
           <div class="tabs" role="tablist">
             <button class="tab active" data-tab="events">Events</button><button class="tab" data-tab="session">Session</button>
             <button class="tab" data-tab="tools">Tools <b id="toolBadge"></b></button>
+            <button class="tab" data-tab="audio">Audio</button>
           </div>
           <div class="tab-view active" id="eventsTab">
             <div class="event-toolbar">
@@ -87,6 +90,12 @@
             <button class="button primary full" id="updateSessionButton" disabled>Update session</button>
           </div>
           <div class="tab-view" id="toolsTab"><div class="tool-empty" id="toolEmpty">Tool calls will appear here.</div><div id="toolCalls"></div></div>
+          <div class="tab-view" id="audioTab">
+            <p class="audio-help">每次判断可试听当前输入、历史音频和缓存。点击“暂停检查”冻结现场；正确与否由你试听后标注，系统不会自动判定。保留最近 20 次记录。</p>
+            <div class="event-toolbar"><span id="reviewSummary">尚无判定记录</span><button class="icon-button" id="clearClassifiers">清空记录</button></div>
+            <div id="pauseBuffers"></div>
+            <div id="classifierRecords"></div>
+          </div>
         </aside>
       </div>
     </main>
