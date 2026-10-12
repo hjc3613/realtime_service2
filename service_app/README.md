@@ -62,6 +62,12 @@ its code and reason in Events and the conversation display.
 `start.sh` defaults to a 400 ms classifier window (`200 ms × 2`); set
 `CLASSIFIER_WINDOW_TICKS` in the environment to override it. This cadence and
 the confirmation counts add delay beyond the logged model-request latency.
+`SEMANTIC_WINDOW_MS=1000` independently controls the recent audio available
+before a target-user turn is locked. An `ignorable` prediction preserves this
+rolling window for the next request. Set it to `0` to restore candidate-only
+inputs. Once `incomplete` or `complete` starts a target turn, classification
+uses the accumulated turn instead of the rolling limit. The startup log reports
+both values.
 Interrupt detection still requires 800 ms of VAD speech before its first vote.
 The startup log includes the effective classifier window. Pause/resume and
 disconnect logs include session IDs, pause state, close reason, and input idle
@@ -105,6 +111,7 @@ INTERACTIVE_DEBUG_DIR=/path/to/interactive_debug
 CLASSIFIER_MAX_TOKENS=5
 TICK_MS=200
 CLASSIFIER_WINDOW_TICKS=2
+SEMANTIC_WINDOW_MS=1000
 INTERRUPT_WINDOW_MS=3000
 INTERRUPT_NEGATIVE_CONFIRMATIONS=2
 INTERRUPT_CONFIRMATIONS=2
@@ -131,14 +138,27 @@ The configured OpenAI-compatible TTS endpoint must return raw, mono PCM16 for
 `TTS_PCM_SAMPLE_RATE` to the service's returned PCM sample rate (8000 for the
 current Kubernetes TTS service). No local TTS proxy is required.
 
-Semantic completeness is classified on each configured audio window without a VAD
-trailing-silence prerequisite. The service requires `COMPLETE_CONFIRMATIONS`
+Semantic completeness is classified at the configured tick cadence without a VAD
+trailing-silence prerequisite. Before a target turn is locked, each request uses
+the most recent `SEMANTIC_WINDOW_MS` of input audio (one second by default),
+including speech and silence. The window updates with incoming packets and
+survives `ignorable`; it does not keep old audio across a long silence. When
+less than one window has arrived, the available audio is used without padding
+or waiting to fill the window. VAD still gates whether a request starts, so
+retaining context does not create repeated requests without new audio or block
+a pending response by itself. Pause freezes this window, which is available
+in the pause snapshot for inspection.
+The service requires `COMPLETE_CONFIRMATIONS`
 consecutive `complete` classifications (two by default) before committing a user
 turn. Before a target-user turn starts, `ignorable` identifies noise, non-speech,
-or speech not addressed to the assistant. That audio is removed from the active
-turn and retained in a separate rolling PCM buffer capped by
-`IGNORABLE_AUDIO_MAX_S` (15 seconds by default). The first `incomplete` result
-locks the active target-user turn; subsequent classifications are constrained to
+or speech not addressed to the assistant. Classified candidate audio is removed
+from the active turn and recorded once in a separate PCM review buffer capped by
+`IGNORABLE_AUDIO_MAX_S` (15 seconds by default); the recent semantic window stays
+available independently. The first `incomplete` or `complete` result
+locks the active target-user turn and restores the preceding context actually
+seen by the model to the active buffer. Later classification and ASR therefore
+keep that onset and accumulate the whole turn, even beyond one second.
+Subsequent classifications are constrained to
 `incomplete` or `complete`, so the turn cannot fall back to `ignorable`. An
 `incomplete` classification resets the completion count. Once locked, the turn
 is committed after `END_SILENCE_MS` of continuous silence (3 seconds by default)

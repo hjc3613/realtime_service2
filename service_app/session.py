@@ -502,6 +502,7 @@ class RealtimeSession:
         self.input_pcm = bytearray()
         self.ignorable_pcm = bytearray()
         self.tick_audio = bytearray()
+        self.semantic_window_ulaw = bytearray()
         self.interrupt_window_ulaw = bytearray()
         self.pre_roll_ulaw = bytearray()
         self.input_resample_state = None
@@ -574,13 +575,15 @@ class RealtimeSession:
         logger.info(
             "session=%s created interrupt_confirmations=%d "
             "interrupt_min_speech_ms=%d interrupt_window_ms=%d "
-            "force_interrupt=disabled tts_pacing=%s classifier_window_ms=%d",
+            "force_interrupt=disabled tts_pacing=%s classifier_window_ms=%d "
+            "semantic_window_ms=%d",
             self.session_id,
             self.settings.interrupt_confirmations,
             self.settings.interrupt_min_speech_ms,
             self.settings.interrupt_window_ms,
             ("input_audio_clock" if self.settings.tts_realtime_pacing else "disabled"),
             self._classifier_window_bytes() * 1000 // 8000,
+            self.settings.semantic_window_ms,
         )
 
     async def close(self) -> None:
@@ -649,6 +652,9 @@ class RealtimeSession:
                         "ignorable": audio_message(bytes(self.ignorable_pcm)),
                         "interrupt": audio_message(
                             ulaw_to_pcm16(self._interrupt_audio_window())[0]
+                        ),
+                        "semantic": audio_message(
+                            ulaw_to_pcm16(bytes(self.semantic_window_ulaw))[0]
                         ),
                     },
                 ))
@@ -722,6 +728,7 @@ class RealtimeSession:
         self.history = [{"role": "system", "content": self.instructions}]
         self.interaction_history.clear()
         self.ignorable_pcm.clear()
+        self.semantic_window_ulaw.clear()
         if self.settings.greeting.strip():
             self.greeting_sent = True
         raw_tools = session.get("tools", [])
@@ -855,6 +862,7 @@ class RealtimeSession:
                 len(audio),
             )
         packet_bytes = len(audio)
+        self._append_semantic_timeline(audio)
         has_speech = self.vad.is_speech(audio)
         self._append_interrupt_timeline(audio)
         self.diagnostic_audio.extend(audio)
@@ -950,11 +958,12 @@ class RealtimeSession:
             or (self.classifier_task and not self.classifier_task.done())
         ):
             return
+        semantic_context = None
         if interrupt:
             window_ulaw = self._interrupt_audio_window()
             classifier_pcm, _ = ulaw_to_pcm16(window_ulaw)
         else:
-            classifier_pcm = bytes(self.input_pcm)
+            classifier_pcm, semantic_context = self._semantic_audio_snapshot()
         if not classifier_pcm:
             logger.warning(
                 "session=%s skipped classification with empty audio snapshot",
@@ -972,6 +981,8 @@ class RealtimeSession:
                 self._classifier_messages(classifier_pcm, interrupt=interrupt),
                 len(self.input_ulaw) * 1000 // 8000,
                 self.candidate_speech_ms,
+                candidate_pcm_bytes=len(self.input_pcm),
+                semantic_context=semantic_context,
             )
         )
 
@@ -984,6 +995,8 @@ class RealtimeSession:
         messages: list[dict[str, Any]],
         candidate_audio_ms: int,
         candidate_speech_ms: int,
+        candidate_pcm_bytes: int | None = None,
+        semantic_context: tuple[bytes, bytes] | None = None,
     ) -> None:
         started_at = time.perf_counter()
         request_id = f"cls_{uuid.uuid4().hex}"
@@ -1103,8 +1116,13 @@ class RealtimeSession:
                     return
                 self._apply_completeness_classification(
                     label,
-                    classified_pcm_bytes=len(classifier_pcm),
+                    classified_pcm_bytes=(
+                        len(classifier_pcm)
+                        if candidate_pcm_bytes is None
+                        else candidate_pcm_bytes
+                    ),
                     classified_audio_ms=candidate_audio_ms,
+                    semantic_context=semantic_context,
                 )
                 status = "applied"
         except Exception as exc:
@@ -1153,6 +1171,29 @@ class RealtimeSession:
 
     def _interrupt_window_bytes(self) -> int:
         return max(1, self.settings.interrupt_window_ms * 8000 // 1000)
+
+    def _append_semantic_timeline(self, audio: bytes) -> None:
+        window_bytes = max(0, self.settings.semantic_window_ms * 8)
+        if not window_bytes:
+            self.semantic_window_ulaw.clear()
+            return
+        self.semantic_window_ulaw.extend(audio)
+        del self.semantic_window_ulaw[:-window_bytes]
+
+    def _semantic_audio_snapshot(self) -> tuple[bytes, tuple[bytes, bytes] | None]:
+        """Use recent audio until locked, then keep the entire active turn."""
+        candidate_pcm = bytes(self.input_pcm)
+        if self.semantic_turn_started or self.settings.semantic_window_ms <= 0:
+            return candidate_pcm, None
+        window_pcm_bytes = self.settings.semantic_window_ms * 32
+        if len(candidate_pcm) >= window_pcm_bytes:
+            return candidate_pcm[-window_pcm_bytes:], None
+        context_bytes = max(0, len(self.semantic_window_ulaw) - len(self.input_ulaw))
+        if not context_bytes:
+            return candidate_pcm, None
+        context_ulaw = bytes(self.semantic_window_ulaw[:context_bytes])
+        context_pcm, _ = ulaw_to_pcm16(context_ulaw)
+        return context_pcm + candidate_pcm, (context_ulaw, context_pcm)
 
     def _interrupt_audio_window(self) -> bytes:
         window_bytes = self._interrupt_window_bytes()
@@ -1247,6 +1288,7 @@ class RealtimeSession:
         label: str,
         classified_pcm_bytes: int | None = None,
         classified_audio_ms: int | None = None,
+        semantic_context: tuple[bytes, bytes] | None = None,
     ) -> None:
         """Advance the semantic-turn state from one classifier result."""
         if label == "ignorable" and not self.semantic_turn_started:
@@ -1270,6 +1312,23 @@ class RealtimeSession:
             )
             self._start_deferred_response()
             return
+
+        if (
+            label in {"incomplete", "complete"}
+            and not self.semantic_turn_started
+            and semantic_context
+        ):
+            # Restore the exact preceding audio seen by the model, so a turn
+            # accepted after an earlier ignorable vote does not lose its onset
+            # in later completeness requests or ASR. New in-flight input stays
+            # after this prefix, and the existing resampler state stays valid.
+            context_ulaw, context_pcm = semantic_context
+            self.input_ulaw[:0] = context_ulaw
+            self.input_pcm[:0] = context_pcm
+            if self.speech_start_ms is not None:
+                self.speech_start_ms = max(
+                    0, self.speech_start_ms - len(context_ulaw) * 1000 // 8000
+                )
 
         if label == "incomplete":
             self.semantic_turn_started = True
@@ -1304,7 +1363,7 @@ class RealtimeSession:
         del self.input_ulaw[:ulaw_bytes]
         self.candidate_speech_ms = max(0, self.candidate_speech_ms - audio_ms)
         if not self.input_pcm:
-            self._clear_input()
+            self._clear_input(preserve_semantic_window=True)
             return
         self.input_generation += 1
         self.consecutive_complete_count = 0
@@ -1498,12 +1557,14 @@ class RealtimeSession:
         max_bytes = max_ms * 32000 // 1000
         return pcm[-max_bytes:]
 
-    def _clear_input(self) -> None:
+    def _clear_input(self, *, preserve_semantic_window: bool = False) -> None:
         self.interrupt_votes.clear()
         self.input_ulaw.clear()
         self.input_generation += 1
         self.input_pcm.clear()
         self.tick_audio.clear()
+        if not preserve_semantic_window:
+            self.semantic_window_ulaw.clear()
         self.pre_roll_ulaw.clear()
         self.input_resample_state = None
         self.speech_seen = False

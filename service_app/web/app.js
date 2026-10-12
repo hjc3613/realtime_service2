@@ -190,6 +190,7 @@
         addDebugAudio(el.pauseBuffers, "暂停时累计的候选音频", event.buffers.candidate);
         addDebugAudio(el.pauseBuffers, "暂停时保留的 ignorable 环境音", event.buffers.ignorable);
         addDebugAudio(el.pauseBuffers, "暂停时的打断滑动窗口", event.buffers.interrupt);
+        addDebugAudio(el.pauseBuffers, "暂停时的完整度滑动窗口", event.buffers.semantic);
         break;
       case "debug.pause.updated":
         state.pausePending = false;

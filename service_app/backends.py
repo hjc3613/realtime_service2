@@ -122,7 +122,7 @@ class TextBackend:
         payload: dict[str, Any] = {
             "model": self.settings.text_model,
             "messages": messages,
-            "temperature": 0.0,
+            "temperature": 0.8,
             "stream": self.settings.text_streaming,
         }
         # DashScope accepts this extra request-body field to disable reasoning.

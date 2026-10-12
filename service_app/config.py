@@ -136,6 +136,9 @@ class Settings:
     tts_language: str = os.getenv("TTS_LANGUAGE", "Auto")
     tick_ms: int = int(os.getenv("TICK_MS", "200"))
     classifier_window_ticks: int = int(os.getenv("CLASSIFIER_WINDOW_TICKS", "2"))
+    # Before a target turn is locked, classify recent audio independently of
+    # the prediction cadence. Zero keeps the legacy candidate-only behavior.
+    semantic_window_ms: int = int(os.getenv("SEMANTIC_WINDOW_MS", "1000"))
     interrupt_window_ms: int = int(os.getenv("INTERRUPT_WINDOW_MS", "3000"))
     interrupt_min_speech_ms: int = int(os.getenv("INTERRUPT_MIN_SPEECH_MS", "800"))
     # Parsed for compatibility. Candidate cleanup is model-gated and no longer
