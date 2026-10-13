@@ -313,21 +313,6 @@ QWEN3_OMNI_USER_INSTRUCTION = (
     "hints, not a whitelist. Preserve the spoken identifier and digits; do not "
     "replace them with a different listed term."
 )
-_LLM_HOTWORD_CONTEXT_PREFIX = (
-    "Voice transcription normalization for tool arguments:\n"
-    "- The user's text was produced by speech recognition and may contain "
-    "phonetic or spelling errors in identifiers and proper names.\n"
-    "- Only when preparing a tool argument, compare a spoken name, ID, username, "
-    "email, phone number, address, ZIP code, airport code, or product term with "
-    "the canonical candidates below.\n"
-    "- If exactly one candidate is a strong phonetic or orthographic match and "
-    "fits the tool parameter, use its exact canonical spelling.\n"
-    "- Never introduce a candidate the user did not attempt to say. Never replace "
-    "ordinary conversational text. If the match is weak or ambiguous, ask the "
-    "user to clarify instead of guessing or calling the tool, but do not tell "
-    "the user about the canonical candidates.\n"
-    "Canonical candidates for the {domain} domain: {candidates}"
-)
 _ASR_TEXT_MARKER = re.compile(r"<asr_text>", re.IGNORECASE)
 _ASR_SPECIAL_TOKEN = re.compile(r"<\|(?:im_end|endoftext)\|>")
 
@@ -364,13 +349,6 @@ def detect_hotword_domain(system_prompt: str) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def llm_hotword_context(domain: str | None) -> str:
-    hotwords = HOT_WORDS_BY_DOMAIN.get(domain or "", ALL_HOT_WORDS)
-    return _LLM_HOTWORD_CONTEXT_PREFIX.format(
-        domain=domain or "all", candidates=", ".join(hotwords)
-    )
-
-
 def qwen3_omni_system_prompt(domain: str | None) -> str:
     hotwords = HOT_WORDS_BY_DOMAIN.get(domain or "", ALL_HOT_WORDS)
     return (
@@ -383,16 +361,6 @@ def default_asr_context(prompt_mode: str, domain: str | None = None) -> str:
     if prompt_mode == "qwen3_asr":
         return QWEN3_ASR_SYSTEM_PROMPT
     return qwen3_omni_system_prompt(domain)
-
-
-def telecom_text_prompt_mode(domain: str | None, configured_mode: str) -> str:
-    """Resolve the telecom text-LLM experiment without affecting other domains."""
-    if domain != "telecom":
-        return "full"
-    mode = configured_mode.strip().lower()
-    if mode not in {"full", "suffix_only", "none"}:
-        raise ValueError("TELECOM_TEXT_PROMPT_MODE must be full, suffix_only, or none")
-    return mode
 
 
 def build_asr_messages(
@@ -409,7 +377,8 @@ def build_asr_messages(
     return messages
 
 
-# Keep these strings byte-for-byte aligned with the ms-swift training messages.
+# The normal-turn prompts match the ms-swift training messages. The first-turn
+# prompt only removes the ignorable definition and output option.
 INTERRUPT_SYSTEM_PROMPT = (
     "You are a speaking-state interruption detector. The assistant is currently "
     "speaking. Classify only the current audio window using the preceding user "
@@ -430,6 +399,11 @@ COMPLETE_SYSTEM_PROMPT = (
     "pauses with background speech; complete = a complete target user intent. "
     "A target user may change topics. Ignore environmental noise and non-target "
     "conversations. Reply with exactly one of: ignorable, incomplete, complete."
+)
+FIRST_TURN_COMPLETE_SYSTEM_PROMPT = COMPLETE_SYSTEM_PROMPT.replace(
+    "ignorable = no target user interaction yet; ", ""
+).replace(
+    "ignorable, incomplete, complete.", "incomplete, complete."
 )
 COMPLETE_QUERY = (
     "stage=idle; classify the current accumulated audio."
@@ -533,6 +507,8 @@ class RealtimeSession:
         self.spoken_assistant_text = ""
         self.current_assistant_remembered = False
         self.greeting_sent = False
+        self.greeting_active = False
+        self.completed_user_turns = 0
         self.tts_interrupted = False
         self.interrupt_ack_pending = False
         self.next_response_ack = ""
@@ -712,25 +688,21 @@ class RealtimeSession:
                 self.session_id,
                 len(ALL_HOT_WORDS),
             )
-        text_prompt_mode = telecom_text_prompt_mode(
-            self.hotword_domain, self.settings.telecom_text_prompt_mode
-        )
+        # Text generation uses the client's system prompt verbatim. Domain
+        # detection remains available solely for the existing ASR hotwords.
         self.instructions = self.base_instructions
-        supplements = []
-        if text_prompt_mode == "full":
-            supplements.append(llm_hotword_context(self.hotword_domain))
-        if text_prompt_mode != "none":
-            supplements.append(self.settings.server_instruction_suffix)
-        for supplement in supplements:
-            if supplement and supplement not in self.instructions:
-                self.instructions = f"{self.instructions.rstrip()}\n\n{supplement}"
         play_greeting = not self.greeting_sent
         self.history = [{"role": "system", "content": self.instructions}]
+        self.completed_user_turns = 0
         self.interaction_history.clear()
         self.ignorable_pcm.clear()
         self.semantic_window_ulaw.clear()
         if self.settings.greeting.strip():
             self.greeting_sent = True
+        if play_greeting and self.greeting_sent:
+            # Protect the greeting before its task gets its first event-loop
+            # turn; incoming audio must not start a competing response.
+            self.greeting_active = True
         raw_tools = session.get("tools", [])
         self.tools = []
         for tool in raw_tools:
@@ -756,22 +728,17 @@ class RealtimeSession:
                 self._play_greeting(self.settings.greeting.strip())
             )
         logger.info(
-            "session=%s configured tools=%d hotword_domain=%s hotwords=%d "
-            "telecom_text_prompt_mode=%s",
+            "session=%s configured tools=%d asr_hotword_domain=%s hotwords=%d",
             self.session_id,
             len(self.tools),
             self.hotword_domain or "none",
-            (
-                len(HOT_WORDS_BY_DOMAIN.get(self.hotword_domain or "", ALL_HOT_WORDS))
-                if text_prompt_mode == "full"
-                else 0
-            ),
-            text_prompt_mode,
+            len(HOT_WORDS_BY_DOMAIN.get(self.hotword_domain or "", ALL_HOT_WORDS)),
         )
 
     async def _play_greeting(self, greeting: str) -> None:
         if not greeting:
             return
+        self.greeting_active = True
         item_id = f"item_{uuid.uuid4().hex}"
         self.assistant_active = True
         self._reset_interrupt_timeline()
@@ -836,12 +803,16 @@ class RealtimeSession:
         except Exception as exc:
             logger.exception("session=%s greeting TTS failed", self.session_id)
             await self.send(_error_event("greeting_tts_error", str(exc)))
+            response_finished = True
         finally:
+            self.greeting_active = False
             self.assistant_active = False
             self.assistant_speaking = False
             self.tts_interrupted = False
             self.tts_task = None
             self.current_item_id = None
+            if not self.closed:
+                self._schedule_classification()
             if response_finished and not self.closed:
                 self._start_next_pending_user_turn()
 
@@ -888,7 +859,11 @@ class RealtimeSession:
         if not self.speech_seen and not has_speech:
             self._append_pre_roll(audio)
             return
-        if self.assistant_speaking and not self.settings.interrupt_enabled:
+        if (
+            self.assistant_speaking
+            and not self.greeting_active
+            and not self.settings.interrupt_enabled
+        ):
             self._clear_input()
             return
         if has_speech:
@@ -940,16 +915,18 @@ class RealtimeSession:
     def _schedule_classification(self) -> None:
         interrupt = (
             self.assistant_active
+            and not self.tts_interrupted
             and self.settings.interrupt_enabled
             and not self.interrupt_confirmed
         )
         if (
             self.closed
+            or self.greeting_active
             or self.debug_paused
             or self.user_turn_processing
             or (self.user_commit_task and not self.user_commit_task.done())
             or not self.speech_seen
-            or (self.assistant_active and not interrupt)
+            or (self.assistant_active and not self.tts_interrupted and not interrupt)
             or (
                 interrupt
                 and self.candidate_speech_ms < self.settings.interrupt_min_speech_ms
@@ -1006,7 +983,7 @@ class RealtimeSession:
             if interrupt
             else (
                 ["complete", "incomplete"]
-                if self.semantic_turn_started
+                if self.completed_user_turns == 0 or self.semantic_turn_started
                 else ["ignorable", "incomplete", "complete"]
             )
         )
@@ -1014,6 +991,9 @@ class RealtimeSession:
         label = None
         error = None
         try:
+            if self.greeting_active:
+                status = "discarded_greeting"
+                return
             if self.debug_enabled:
                 if self.debug_audio_on_demand:
                     self.debug_classifier_inputs[request_id] = messages
@@ -1068,11 +1048,15 @@ class RealtimeSession:
                         self.session_id,
                     )
                     return
-                if not self.assistant_active:
+                if (
+                    self.greeting_active
+                    or not self.assistant_active
+                    or self.tts_interrupted
+                ):
                     status = "discarded_assistant_idle"
                     logger.info(
                         "session=%s discarding interrupt classification after "
-                        "assistant became idle",
+                        "assistant yielded the floor",
                         self.session_id,
                     )
                     return
@@ -1088,6 +1072,7 @@ class RealtimeSession:
                     messages,
                     choices,
                 )
+                label = self._normalize_semantic_label(label)
                 logger.info(
                     "session=%s completeness classification=%s latency_ms=%.1f "
                     "input_advanced_ms=%d",
@@ -1106,7 +1091,9 @@ class RealtimeSession:
                         self.session_id,
                     )
                     return
-                if self.assistant_active:
+                if self.greeting_active or (
+                    self.assistant_active and not self.tts_interrupted
+                ):
                     status = "discarded_assistant_active"
                     logger.info(
                         "session=%s discarding completeness classification after "
@@ -1137,7 +1124,7 @@ class RealtimeSession:
             self.consecutive_interrupt_count = 0
             self.interrupt_votes.clear()
             self.tts_playback_allowed.set()
-            if not self.assistant_active:
+            if not self.assistant_active or self.tts_interrupted:
                 self.consecutive_complete_count = 0
             logger.exception("session=%s classifier failed", self.session_id)
             await self.send(_error_event("classifier_error", str(exc)))
@@ -1183,7 +1170,11 @@ class RealtimeSession:
     def _semantic_audio_snapshot(self) -> tuple[bytes, tuple[bytes, bytes] | None]:
         """Use recent audio until locked, then keep the entire active turn."""
         candidate_pcm = bytes(self.input_pcm)
-        if self.semantic_turn_started or self.settings.semantic_window_ms <= 0:
+        if (
+            self.completed_user_turns == 0
+            or self.semantic_turn_started
+            or self.settings.semantic_window_ms <= 0
+        ):
             return candidate_pcm, None
         window_pcm_bytes = self.settings.semantic_window_ms * 32
         if len(candidate_pcm) >= window_pcm_bytes:
@@ -1219,6 +1210,8 @@ class RealtimeSession:
             del self.interrupt_window_ulaw[:-window_bytes]
 
     async def _apply_interrupt_classification(self, label: str) -> None:
+        if self.greeting_active:
+            return
         self.interrupt_votes.append(label == "interrupt")
         del self.interrupt_votes[:-3]
         positive_votes = sum(self.interrupt_votes)
@@ -1283,6 +1276,16 @@ class RealtimeSession:
         self.pre_roll_ulaw.extend(trailing_audio)
         self._start_deferred_response()
 
+    def _normalize_semantic_label(self, label: str) -> str:
+        if self.completed_user_turns == 0 and label == "ignorable":
+            logger.warning(
+                "session=%s backend returned ignorable for first user turn; "
+                "treating it as incomplete to preserve speech",
+                self.session_id,
+            )
+            return "incomplete"
+        return label
+
     def _apply_completeness_classification(
         self,
         label: str,
@@ -1291,6 +1294,7 @@ class RealtimeSession:
         semantic_context: tuple[bytes, bytes] | None = None,
     ) -> None:
         """Advance the semantic-turn state from one classifier result."""
+        label = self._normalize_semantic_label(label)
         if label == "ignorable" and not self.semantic_turn_started:
             prefix_pcm_bytes = min(
                 len(self.input_pcm),
@@ -1399,7 +1403,11 @@ class RealtimeSession:
                 user_content.extend(preceding_user["content"])
                 query = "\n" + query
         else:
-            prompt = COMPLETE_SYSTEM_PROMPT
+            prompt = (
+                FIRST_TURN_COMPLETE_SYSTEM_PROMPT
+                if self.completed_user_turns == 0
+                else COMPLETE_SYSTEM_PROMPT
+            )
             query = COMPLETE_QUERY
         user_content.extend(
             [{"type": "text", "text": query}, audio_message(pcm)]
@@ -1432,6 +1440,7 @@ class RealtimeSession:
     def _schedule_user_commit(self) -> None:
         if (
             self.closed
+            or self.greeting_active
             or self.debug_paused
             or self.user_turn_processing
             or not self.speech_seen
@@ -1450,7 +1459,12 @@ class RealtimeSession:
 
     async def _commit_user_audio(self) -> None:
         await self.debug_resume.wait()
-        if self.user_turn_processing or not self.speech_seen or not self.input_pcm:
+        if (
+            self.greeting_active
+            or self.user_turn_processing
+            or not self.speech_seen
+            or not self.input_pcm
+        ):
             return
         pcm = bytes(self.input_pcm)
         interrupt_ack = (
@@ -1517,6 +1531,7 @@ class RealtimeSession:
                 )
             )
             if transcript:
+                self.completed_user_turns += 1
                 interaction_message = {
                     "role": "user",
                     "content": [audio_message(self._history_user_pcm(pcm))],
@@ -1714,7 +1729,15 @@ class RealtimeSession:
                 assistant_text,
                 (time.perf_counter() - llm_started_at) * 1000,
             )
-            for _, call in sorted(tool_calls.items()):
+            generated_tool_calls = tool_calls
+            tool_calls = {}
+            for index, call in sorted(generated_tool_calls.items()):
+                if self.tts_interrupted:
+                    logger.info(
+                        "session=%s discarding unissued tool calls from interrupted response",
+                        self.session_id,
+                    )
+                    break
                 call_id = call["id"]
                 if not call["name"]:
                     raise ValueError("Text backend returned a tool call without a name")
@@ -1757,6 +1780,7 @@ class RealtimeSession:
                 )
                 call["arguments"] = arguments
                 self.pending_tool_calls[call_id] = call
+                tool_calls[index] = call
             response_interrupted = self.tts_interrupted
             if tool_calls:
                 assistant_message = {
@@ -1862,12 +1886,17 @@ class RealtimeSession:
                 assistant_text,
             )
             await self.send(_error_event("response_error", str(exc)))
+            # The failed old pipeline has released the floor too. Do not leave
+            # an already transcribed replacement turn waiting for another input.
+            response_finished = True
         finally:
             self.assistant_active = False
             self.assistant_speaking = False
             self.tts_interrupted = False
             self.tts_task = None
             self.current_item_id = None
+            if not self.closed:
+                self._schedule_classification()
             if response_finished and not self.closed and not self.pending_tool_calls:
                 self._start_next_pending_user_turn()
 
@@ -2066,9 +2095,15 @@ class RealtimeSession:
         )
 
     async def _interrupt(self) -> None:
-        if self.interrupt_confirmed:
+        if self.greeting_active or self.interrupt_confirmed:
             return
         self.interrupt_confirmed = True
+        # A confirmed interruption already establishes that the target user
+        # has taken the floor. Keep the whole candidate (including its onset)
+        # and enable completeness/silence handling while old LLM output drains.
+        if self.speech_seen and self.input_pcm:
+            self.semantic_turn_started = True
+            self.consecutive_complete_count = 0
         await self.send(
             _event(
                 "input_audio_buffer.speech_started",

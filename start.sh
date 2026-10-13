@@ -70,20 +70,6 @@ export TEXT_MODEL='qwen3-32b-tauvoice'
 # export TEXT_MODEL='deepseek-v4-flash-ga-260731'
 # export BACKEND_TRUST_ENV=true
 
-# Appended to the system prompt supplied by tau2-bench. Keep this generic: do not
-# include task IDs, expected database states, or benchmark answers.
-export SERVER_INSTRUCTION_SUFFIX="$(cat <<'EOF'
-Operational tool requirements:
-- Never claim that a database-changing operation succeeded until the corresponding write tool returned a successful result.
-- Once the user provides the required information and confirmation, call the appropriate write tool before giving further explanation.
-- Track every outstanding user request. Completing one operation does not complete the remaining operations.
-- A status inquiry such as 'are you still there' or 'any update' does not revoke an earlier request or confirmation.
-- When multiple independent tool calls are needed, issue them together when possible.
-- Voice transcription can corrupt identifiers. If an ID, order number, email address, phone number, ZIP code, or other identifying value is invalid, not found, or fails verification, explicitly tell the user the error id value and then ask the user to slowly repeat that value, preferably in smaller groups or character by character. If user forget some ID, ask for another one to veryfied.
-- After the user repeats the value, use the new transcription and retry the relevant lookup or verification tool. If it still fails, explain which value could not be verified and ask for another supported identifier.
-EOF
-)"
-
 export INTERACTIVE_HISTORY_MESSAGES=10
 
 export COMPLETE_CONFIRMATIONS=1

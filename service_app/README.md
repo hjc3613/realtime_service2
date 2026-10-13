@@ -2,8 +2,10 @@
 
 This is a small OpenAI-Realtime-compatible WebSocket facade for tau2's current
 OpenAI provider. It accepts 8 kHz mono mu-law audio and emits the same format.
-Interactive classification uses the exact system prompts and message layout in
+Normal-turn interaction classification uses the system prompts and message layout in
 `new_interactive_assets/ms_swift/{interrupt,semantic_complete}/train.jsonl`.
+The first user turn uses the same completion prompt with only the `ignorable`
+definition and output option removed, leaving two output labels.
 Each `<audio>` is converted to an `audio_url` block using the same ordering and
 text boundaries as `new_interactive_assets/evaluate_duplex.py`.
 During interruption detection, the last historical user audio is merged into
@@ -63,7 +65,8 @@ its code and reason in Events and the conversation display.
 `CLASSIFIER_WINDOW_TICKS` in the environment to override it. This cadence and
 the confirmation counts add delay beyond the logged model-request latency.
 `SEMANTIC_WINDOW_MS=1000` independently controls the recent audio available
-before a target-user turn is locked. An `ignorable` prediction preserves this
+before a target-user turn is locked, starting with the second user turn.
+The first user turn always uses its accumulated audio. An `ignorable` prediction preserves this
 rolling window for the next request. Set it to `0` to restore candidate-only
 inputs. Once `incomplete` or `complete` starts a target turn, classification
 uses the accumulated turn instead of the rolling limit. The startup log reports
@@ -139,7 +142,14 @@ The configured OpenAI-compatible TTS endpoint must return raw, mono PCM16 for
 current Kubernetes TTS service). No local TTS proxy is required.
 
 Semantic completeness is classified at the configured tick cadence without a VAD
-trailing-silence prerequisite. Before a target turn is locked, each request uses
+trailing-silence prerequisite. The first user turn offers only `incomplete` and
+`complete`, using the full accumulated audio without the recent-window limit.
+The greeting does not count as a user turn. Only a successfully committed,
+non-empty ASR transcript advances the count; empty or failed ASR leaves the
+first-turn policy active. Resetting the conversation history on `session.update`
+also resets this count.
+Starting with the second user turn, the initial choices are `ignorable`,
+`incomplete`, and `complete`. Before a target turn is locked, each request uses
 the most recent `SEMANTIC_WINDOW_MS` of input audio (one second by default),
 including speech and silence. The window updates with incoming packets and
 survives `ignorable`; it does not keep old audio across a long silence. When
@@ -163,8 +173,9 @@ Subsequent classifications are constrained to
 `incomplete` classification resets the completion count. Once locked, the turn
 is committed after `END_SILENCE_MS` of continuous silence (3 seconds by default)
 even if the classifier never returns `complete`. Set
-`INTERRUPT_ENABLED=false` to ignore all user audio while the assistant is
-speaking and let the response finish without interruption. It buffers two
+`INTERRUPT_ENABLED=false` to ignore user audio during normal assistant playback
+and let the response finish without interruption. The protected greeting retains
+incoming user audio independently of this setting. It buffers two
 200 ms ticks between classifier calls. Interrupt classification uses the latest
 three seconds of the current user candidate, left-padded with silence at the
 start of speech. Historical user audio is independently capped by
@@ -173,24 +184,30 @@ candidate buffering; it cannot
 pause or cancel a response and is explicitly treated as unreliable in noisy
 environments. Candidates that begin anywhere during an active response, including
 LLM and TTS synthesis gaps, are sent to the interaction model. The first
-`interrupt` classification closes the playback gate, and the second consecutive
-result stops TTS. LLM streaming continues to completion so a tool call is not
-lost, while generated but unheard assistant text is discarded from history. A
-subsequent `backchannel` or `ignorable` classification before confirmation
-resumes playback from
-the same point without catching up elapsed input ticks in a burst. Repeated
+`interrupt` classification closes the playback gate. By default, two positive
+votes in the latest three predictions confirm interruption and stop TTS. LLM
+streaming continues to completion, while generated but unheard assistant text
+is discarded from history. Unissued tool calls from that interrupted response
+are discarded; already emitted calls still wait for their results. Playback
+resumes from the same point when the recent votes no longer contain a positive,
+without catching up elapsed input ticks in a burst. Repeated
 negative classifications discard the noisy candidate without requiring VAD
-silence. Interruption requires `INTERRUPT_CONFIRMATIONS` consecutive `interrupt`
-results (two by default); any `backchannel` or `ignorable` result resets that
-count. After the interrupted user turn is committed, `INTERRUPT_ACK` is spoken immediately before the next LLM
+silence. `INTERRUPT_CONFIRMATIONS` sets the required number of positive votes in
+the latest three predictions (two by default). A confirmed interruption locks
+the target-user turn immediately: subsequent semantic requests use its complete
+accumulated audio, even if the recent one-second window has become silent.
+Completeness classification and the silence fallback continue while the old LLM
+drains. ASR may commit and queue the new turn during that time; the new response
+starts automatically once the old generation and any emitted tool calls finish.
+After the interrupted user turn is committed, `INTERRUPT_ACK` is spoken immediately before the next LLM
 response and stored with that response as one assistant history message. A candidate rejected repeatedly by the interaction model is
 discarded. VAD-only forced interruption is disabled permanently in the session path; the legacy
 `INTERRUPT_FORCE_SPEECH_MS` setting is parsed for compatibility but is ignored.
 `VAD_PRE_ROLL_MS` preserves audio immediately before the first detected speech
 packet. TTS synthesis is not treated as active playback, and the next clause is
 prefetched while the current clause plays. Sustained VAD speech is never enough
-to interrupt a response by itself; only the configured consecutive interaction
-model results can stop TTS. When a response starts with a tool call, `TOOL_CALL_ACK` is emitted as soon as the first tool-call delta arrives,
+to interrupt a response by itself; only the configured interaction-model votes
+can stop TTS. When a response starts with a tool call, `TOOL_CALL_ACK` is emitted as soon as the first tool-call delta arrives,
 while the tool request continues, and is emitted at most once per user turn. If
 the model requests several tools in parallel, only the first is emitted; its
 result is returned to the model before another tool can be requested.
@@ -212,18 +229,15 @@ system message for either mode;
 set it to an empty string to omit that message. Both raw
 `language English<asr_text>...` and text-only responses are accepted.
 
-The service identifies `retail`, `airline`, or `telecom` from the domain
-policy embedded in Tau2's full-duplex system prompt. Only that domain's
-canonical candidates are appended to the text LLM system prompt and, in
-Qwen3-Omni mode, to the ASR system message. If the prompt is unknown or
-ambiguous, all three hotword lists are appended and a warning is logged. The
-LLM is instructed to
-normalize an ASR-corrupted name, ID, username, email, phone number, address, ZIP
-code, airport code, or product term only when there is one strong phonetic or
-spelling match that fits the tool parameter. It must not insert a candidate the
-user did not attempt to say, and must ask for clarification when several
-candidates are plausible. This context is rebuilt on every session update and
-does not duplicate `SERVER_INSTRUCTION_SUFFIX`.
+The text LLM receives the client's system instructions without additional
+normalization prompts, hotword lists, or server instruction suffixes.
+`SERVER_INSTRUCTION_SUFFIX` and `TELECOM_TEXT_PROMPT_MODE` are no longer used.
+The service still identifies `retail`, `airline`, or `telecom` from the domain
+policy embedded in Tau2's full-duplex system prompt for ASR. In Qwen3-Omni mode,
+only that domain's canonical terms are added to the ASR system message. If the
+domain is unknown or ambiguous, all three ASR hotword lists are used and a
+warning is logged. Qwen3-ASR's audio-only default and explicit `ASR_CONTEXT`
+overrides retain their existing behavior.
 
 Set `ASR_DEBUG_DIR` to save the exact 16 kHz mono PCM WAV passed to each ASR
 request. Files are grouped by realtime session; the adjacent JSON and
@@ -317,12 +331,17 @@ and seeds. It supports only the `pcm_16000` output requested by tau2. Responses
 include `x-local-tts-speaker` so the selected local voice is visible to clients.
 
 On the first `session.update`, `GREETING` is spoken once and added to the model
-and interaction histories after playback. If interrupted, only the heard prefix is recorded. Set it to an empty string to disable the greeting.
+and interaction histories after playback. Its synthesis and playback are
+protected from interruption: interaction predictions and user commits wait until
+it finishes. Incoming audio continues advancing the playback clock and is
+buffered for the first user's completion check afterward. Pause/resume still
+works for inspection. Set `GREETING` to an empty string to disable it.
 
-Candidate audio that begins at any point during an active response is classified
+Candidate audio that begins at any point during a normal active response is classified
 by the interaction model, including while the LLM or TTS backend is still
 generating. VAD never cancels unsent audio directly. Confirmed interruptions stop
-TTS immediately but let LLM generation and tool-call assembly finish. No full
+TTS immediately and let LLM generation finish, discarding unissued tool calls.
+No full
 text completion event is sent, and only audio actually delivered is retained in
 history. Pending user turns use latest-wins semantics: a newly committed turn
 replaces any older turn that has not started, and no deferred response starts

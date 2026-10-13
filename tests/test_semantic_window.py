@@ -29,6 +29,7 @@ class SemanticWindowTests(unittest.IsolatedAsyncioTestCase):
             tick_ms=200, classifier_window_ticks=2, semantic_window_ms=window_ms,
         ))
         session.debug_enabled = True
+        session.completed_user_turns = 1
         session.vad = FixedVAD()
         session.interactive.classify = AsyncMock(return_value='ignorable')
         return session, events

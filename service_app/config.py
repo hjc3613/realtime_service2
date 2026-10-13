@@ -118,9 +118,6 @@ class Settings:
     text_api_key: str = os.getenv(
         "TEXT_API_KEY", os.getenv("LOCAL_MODEL_API_KEY", "EMPTY")
     )
-    server_instruction_suffix: str = os.getenv("SERVER_INSTRUCTION_SUFFIX", "").strip()
-    # Telecom text-LLM-only experiment: full, suffix_only, or none.
-    telecom_text_prompt_mode: str = os.getenv("TELECOM_TEXT_PROMPT_MODE", "full")
     tts_url: str = _env("TTS_BASE_URL", "http://127.0.0.1:8091/v1")
     tts_model: str = os.getenv("TTS_MODEL", "qwen3_tts")
     # The direct OpenAI-compatible TTS endpoint returns raw mono PCM16.

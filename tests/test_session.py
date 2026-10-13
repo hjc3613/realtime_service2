@@ -136,9 +136,12 @@ class RealtimeSessionTests(unittest.IsolatedAsyncioTestCase):
             tts_realtime_pacing=False,
             tool_call_ack="",
         )
-        return RealtimeSession(send, settings), events
+        session = RealtimeSession(send, settings)
+        # General turn tests exercise the normal policy after the first turn.
+        session.completed_user_turns = 1
+        return session, events
 
-    async def test_session_appends_server_instruction_suffix_once(self) -> None:
+    async def test_session_keeps_client_system_instructions_verbatim(self) -> None:
         events: list[dict] = []
 
         async def send(event: dict) -> None:
@@ -149,20 +152,17 @@ class RealtimeSessionTests(unittest.IsolatedAsyncioTestCase):
             Settings(
                 greeting="",
                 interactive_debug_dir=None,
-                server_instruction_suffix="Local tool discipline.",
             ),
         )
 
         await session._session_update({"instructions": "Tau retail policy."})
         self.assertEqual(
             session.history[0]["content"],
-            "Tau retail policy.\n\nLocal tool discipline.",
+            "Tau retail policy.",
         )
 
         await session._session_update({})
-        self.assertEqual(
-            session.history[0]["content"].count("Local tool discipline."), 1
-        )
+        self.assertEqual(session.history[0]["content"], "Tau retail policy.")
 
     async def test_pending_fragments_are_retained_in_order(self) -> None:
         session, _ = self.make_session()
