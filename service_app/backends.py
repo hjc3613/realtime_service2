@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import io
 import json
 import logging
 import re
+import wave
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
@@ -34,6 +37,41 @@ def audio_message(pcm: bytes) -> dict[str, Any]:
     }
 
 
+def _qwen25_audio_processor_kwargs(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Size padding for every audio in the request, including history.
+
+    The service sends inline WAVs. Read their metadata without decoding samples
+    or resampling; leave other audio sources to the server's default processor.
+    """
+    longest = 0
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") not in {"audio_url", "input_audio"}:
+                continue
+            if block.get("type") != "audio_url":
+                return {}
+            url = block.get("audio_url", {}).get("url", "")
+            if not url.startswith("data:audio/wav;base64,"):
+                return {}
+            try:
+                wav = base64.b64decode(url.split(",", 1)[1], validate=True)
+                with wave.open(io.BytesIO(wav), "rb") as reader:
+                    frames, rate = reader.getnframes(), reader.getframerate()
+                if frames <= 0 or rate <= 0:
+                    return {}
+            except (ValueError, binascii.Error, wave.Error, EOFError):
+                logger.warning("Cannot read interactive WAV metadata; using default mel padding")
+                return {}
+            longest = max(longest, (frames * MODEL_RATE + rate - 1) // rate)
+    if not longest:
+        return {}
+    max_length = ((longest + 400 + 159) // 160) * 160
+    return {"audio_kwargs": {"max_length": max_length, "truncation": False}}
+
+
 class InteractiveBackend:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -50,6 +88,7 @@ class InteractiveBackend:
                 max_tokens=self.settings.classifier_max_tokens,
                 choices=choices,
                 timeout_s=self.settings.classifier_timeout_s,
+                dynamic_mel=self.settings.interactive_qwen25_dynamic_mel,
             )
         ).lower()
 
@@ -75,6 +114,7 @@ class InteractiveBackend:
         choices: list[str] | None,
         timeout_s: float,
         language: str | None = None,
+        dynamic_mel: bool = False,
     ) -> str:
         payload = {
             "model": model,
@@ -90,6 +130,10 @@ class InteractiveBackend:
             payload["top_k"] = 1
         if language and language.lower() != "auto":
             payload["language"] = language
+        if dynamic_mel:
+            processor_kwargs = _qwen25_audio_processor_kwargs(messages)
+            if processor_kwargs:
+                payload["mm_processor_kwargs"] = processor_kwargs
 
         async with httpx.AsyncClient(
             timeout=timeout_s,

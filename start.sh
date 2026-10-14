@@ -18,6 +18,8 @@ export LOCAL_MODEL_API_KEY='junchao.hu-104a732c-eaa6-452f-974e-604801e371f7'
 
 export INTERACTIVE_BASE_URL='http://api-cybotforge-pre.brapp.com/v1'
 export INTERACTIVE_MODEL='qwen2-5-omni-tauvoice'
+# Enable for Qwen2.5-Omni; set false when switching to Qwen3-Omni or the gateway.
+export INTERACTIVE_QWEN25_DYNAMIC_MEL="${INTERACTIVE_QWEN25_DYNAMIC_MEL:-true}"
 
 # export ASR_BASE_URL='http://localhost:5005/v1'
 # export ASR_MODEL='qwen3_omni_asr'

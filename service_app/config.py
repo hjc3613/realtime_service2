@@ -98,6 +98,9 @@ def _elevenlabs_voice_map() -> tuple[tuple[str, str], ...]:
 class Settings:
     interactive_url: str = _env("INTERACTIVE_BASE_URL", "http://127.0.0.1:9004/v1")
     interactive_model: str = os.getenv("INTERACTIVE_MODEL", "interactive_model")
+    interactive_qwen25_dynamic_mel: bool = _env_bool(
+        "INTERACTIVE_QWEN25_DYNAMIC_MEL", False
+    )
     asr_url: str = _env("ASR_BASE_URL", "http://localhost:5005/v1")
     asr_model: str = os.getenv(
         "ASR_MODEL", os.getenv("INTERACTIVE_MODEL", "interactive_model")

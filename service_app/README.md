@@ -92,6 +92,7 @@ Environment variables:
 ```text
 INTERACTIVE_BASE_URL=http://127.0.0.1:9004/v1
 INTERACTIVE_MODEL=interactive_model
+INTERACTIVE_QWEN25_DYNAMIC_MEL=false
 ASR_BASE_URL=http://localhost:5005/v1
 ASR_MODEL=interactive_model
 ASR_PROMPT_MODE=auto
@@ -211,6 +212,19 @@ can stop TTS. When a response starts with a tool call, `TOOL_CALL_ACK` is emitte
 while the tool request continues, and is emitted at most once per user turn. If
 the model requests several tools in parallel, only the first is emitted; its
 result is returned to the model before another tool can be requested.
+
+For Qwen2.5-Omni interactive models, set `INTERACTIVE_QWEN25_DYNAMIC_MEL=true`
+to send request-level `mm_processor_kwargs.audio_kwargs` with dynamic
+`max_length` and `truncation=false`. The length is computed from the longest
+audio in the request (including history), converted to 16 kHz sample count,
+with 400 samples of FFT tail and alignment to 160 samples. This avoids the
+processor's fixed long padding for short audio. Only inline WAV metadata is
+read; requests containing unsupported or unreadable audio retain default
+processor behavior. This option affects both interruption and completeness
+classification, but not ASR. It defaults to false because the served model
+alias does not reliably identify its architecture. `start.sh` enables it for
+its configured Qwen2.5-Omni model; set it to false when switching that script
+to Qwen3-Omni or the interaction gateway.
 
 Interruption and semantic-completeness classification use
 `INTERACTIVE_BASE_URL` and `INTERACTIVE_MODEL`. ASR uses the independent
